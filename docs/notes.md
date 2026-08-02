@@ -174,3 +174,32 @@ getById changed from .orElse(null) to .orElseThrow(new ResourceNotFoundException
 
 ### Custom exceptions
 ResourceNotFoundException extends RuntimeException so it can be thrown anywhere without cluttering method signatures. Its message travels to the global handler.
+
+## Day 7 — API key authentication with Spring Security
+
+### The problem
+Every endpoint was open. Anyone who could reach the server could create payments or read any merchant's ledger. For a payment system that is unacceptable — the entire product is trust.
+
+### Two kinds of caller, two kinds of credential
+A payment gateway is called by machines and by people, and they authenticate differently. A merchant's backend server proves itself with an API key sent on every request — like a staff badge. A human logging into a dashboard uses email and password and receives a session token (JWT). Today covers the first, which is what protects the payment API itself.
+
+### Spring Security is secure by default
+Adding the dependency immediately locked every endpoint and generated a random password at startup. Nothing was configured yet — the framework's stance is "deny everything until told otherwise." The job then is to open specific doors, not to add locks.
+
+### Filters — the guard before the waiter
+A filter runs on every request before it reaches any controller. Spring Security is built as a chain of these. ApiKeyFilter extends OncePerRequestFilter, reads the X-API-Key header, looks the key up via findByApiKey, and if it matches a merchant, marks the request authenticated in the SecurityContext, recording which merchant it is. If no key or an unknown key, it does nothing and the request stays unauthenticated. addFilterBefore inserts it into the chain.
+
+### SecurityFilterChain configuration
+requestMatchers declares per-path rules: /api/v1/health and /api/v1/merchants are permitAll, anyRequest().authenticated() covers the rest — critically /api/v1/payments. CSRF is disabled because CSRF protection targets browser form posts, not stateless APIs.
+
+### The bootstrap problem
+Merchant creation is left open deliberately: a new merchant needs to exist before it can have a key, so requiring a key to get your first key is circular. Real systems solve this with a separate admin or signup path.
+
+### 401 vs 403
+401 Unauthorized means "I don't know who you are." 403 Forbidden means "I know a request arrived but you are not permitted." Sending an unrecognised key produced 403 — the filter ran, found no matching merchant, and Security refused the request.
+
+### Key format conventions
+Keys are prefixed: tk_ for Transakt, as Stripe uses sk_ and Razorpay rzp_. A prefix makes a key instantly recognisable and easy to scan for if one leaks into logs or a repository.
+
+### Dependency versions can break at runtime, not just compile time
+Spring Boot 4.1.0 had no matching spring-boot-starter-security. Pinning the starter to 3.4.1 let the project compile, but at runtime the security library and the core disagreed on where HttpSecurity lived, so the bean could not be found. The correct fix was aligning the whole project to one generation (Boot 3.4.1) and letting the parent POM manage every version — which also required renaming spring-boot-starter-webmvc to spring-boot-starter-web and webmvc-test to test, since artifact names changed between major versions.
