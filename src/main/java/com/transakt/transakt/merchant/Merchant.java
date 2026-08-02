@@ -29,6 +29,9 @@ public class Merchant {
     @Column(name = "business_name")
     private String businessName;
 
+    @Column(name = "api_key", unique = true)
+    private String apiKey;
+
     @Column(name = "created_at", updatable = false)
     private Instant createdAt;
 }

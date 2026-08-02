@@ -18,6 +18,7 @@ public class MerchantService {
 
     public Merchant create(Merchant merchant) {
         merchant.setId(UUID.randomUUID().toString());
+        merchant.setApiKey("tk_" + UUID.randomUUID().toString().replace("-", ""));
         merchant.setCreatedAt(Instant.now());
         return merchantRepository.save(merchant);
     }
