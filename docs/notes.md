@@ -99,6 +99,9 @@ Verified by experiment: created a merchant, restarted the app, fetched it — go
 - Memory is finite; a real merchant table doesn't fit in RAM.
 
 A database solves durability, shared state, querying, and concurrency. That is the entire reason JPA and PostgreSQL arrive next.
+
+---
+
 ## Day 4 — Real database with PostgreSQL and JPA
 
 ### The problem we solved
@@ -127,6 +130,8 @@ By default Spring keeps the database session open until the HTTP response is ful
 ### show-sql: true
 Prints every SQL statement Hibernate generates to the console. The best learning setting available — you watch exactly what your Java produces, including the insert and select statements behind save() and findById().
 
+---
+
 ## Day 5 — Payments and the double-entry ledger
 
 ### The problem
@@ -152,6 +157,8 @@ LedgerEntryRepository declares `List<LedgerEntry> findByPaymentId(String payment
 ### Nested resource URLs
 GET /api/v1/payments/{id}/ledger exposes the ledger belonging to a payment — a related sub-resource under its parent. This is standard REST design for expressing "the X that belongs to this Y."
 
+---
+
 ## Day 6 — Validation and global error handling
 
 ### The problem
@@ -174,6 +181,8 @@ getById changed from .orElse(null) to .orElseThrow(new ResourceNotFoundException
 
 ### Custom exceptions
 ResourceNotFoundException extends RuntimeException so it can be thrown anywhere without cluttering method signatures. Its message travels to the global handler.
+
+---
 
 ## Day 7 — API key authentication with Spring Security
 
@@ -203,3 +212,124 @@ Keys are prefixed: tk_ for Transakt, as Stripe uses sk_ and Razorpay rzp_. A pre
 
 ### Dependency versions can break at runtime, not just compile time
 Spring Boot 4.1.0 had no matching spring-boot-starter-security. Pinning the starter to 3.4.1 let the project compile, but at runtime the security library and the core disagreed on where HttpSecurity lived, so the bean could not be found. The correct fix was aligning the whole project to one generation (Boot 3.4.1) and letting the parent POM manage every version — which also required renaming spring-boot-starter-webmvc to spring-boot-starter-web and webmvc-test to test, since artifact names changed between major versions.
+
+---
+
+## Day 8 — Passwords and JSON Web Tokens
+
+### The problem
+Day 7 closed the payment API to machines, but there is still no way for a *person* to log in. A merchant who wants to open a dashboard and look at their own payments has no credential to offer — a Merchant row has a name, an email, and an API key, and nothing a human could type into a login form.
+
+Handing that human the API key instead would be the wrong move twice over. It never expires, so a leak is permanent. And it carries no notion of role, so there is no way to distinguish a merchant from an admin.
+
+### Why passwords are never stored
+If `hunter2` sits in a column and the database leaks, every merchant's password is public. Worse, people reuse passwords, so the leak reaches their email accounts and their banks too.
+
+Instead the database stores a **fingerprint**. On login the incoming plaintext is fingerprinted and the two fingerprints are compared. The original string exists nowhere — not in a column, not in a log, not in a backup.
+
+### Why BCrypt and not SHA-256
+**BCrypt is deliberately slow**, and that is the entire feature. A fast hash lets an attacker holding a stolen database try billions of candidates per second. BCrypt takes roughly 100ms per attempt. On a login endpoint that is invisible; against millions of guesses it is ruinous.
+
+**BCrypt salts automatically.** Random noise is mixed into the password before hashing, so two merchants who both chose `hunter2` end up with completely different hashes. Without salting, an attacker precomputes a table of common passwords once and cracks every account in the database simultaneously.
+
+The salt is stored *inside* the hash string, which is why there is no separate salt column and why the salt is never managed by hand.
+
+### Anatomy of the stored value
+```
+$2a$10$Wrs1LY3CQTEeu2uMI7QMU.ufs2d2/MChD46dl4m0doW7scVCLqP2i
+ └┬┘ └┬┘ └───────────────────────┬──────────────────────────┘
+  │   │                          └── salt + hash
+  │   └── cost factor: 2^10 rounds
+  └── algorithm version
+```
+Always exactly 60 characters. A common production bug is setting the column to VARCHAR(20) while thinking about password *length*, which silently truncates every hash.
+
+### @JsonProperty(WRITE_ONLY)
+`/api/v1/merchants` is still permitAll, so anyone on the internet can GET the list. Without this annotation Jackson would serialise the password field into every response and every hash in the system would be one public URL away.
+
+WRITE_ONLY means Jackson accepts the field coming *in* from a request body and never writes it *out*. Same instinct as the Day 6 DTOs: make the unsafe thing structurally impossible rather than relying on remembering.
+
+### @Configuration versus @Service — two ways Spring learns about beans
+`@Service`, `@Component`, `@RestController` all say **"this class *is* a bean"** — Spring scans, finds the annotation, and builds one instance. The class itself is the product.
+
+`@Configuration` says **"this class is a *source of* beans"** — Spring ignores the object and instead calls the `@Bean` methods inside it, keeping whatever they return. The class is a factory.
+
+Why does PasswordEncoder need the factory treatment? Because BCryptPasswordEncoder lives inside Spring Security's jar. I do not own that source file, so I cannot annotate it. A `@Bean` method is the only route into the container.
+
+This pattern will recur for every third-party object from now on — RestTemplate, ObjectMapper, Redis clients, Kafka producers. Anything I did not write arrives through a `@Bean` method.
+
+### Why the encoder lives in its own class
+SecurityConfig takes ApiKeyFilter through its constructor. If ApiKeyFilter reached for MerchantService, and MerchantService needed PasswordEncoder, and PasswordEncoder lived inside SecurityConfig, that is a ring with no starting point — Spring refuses to boot with "the dependencies of some of the beans form a cycle."
+
+Putting the bean in its own PasswordConfig breaks the ring, because nothing in that chain depends on PasswordConfig. It is also simply tidier: SecurityConfig's job is describing the filter chain, and password hashing is a separate concern that happens to be security-adjacent.
+
+### Return the interface, not the implementation
+The bean method returns `PasswordEncoder`, not `BCryptPasswordEncoder`. Every class that injects it only knows "something that can encode and match passwords." Migrating to Argon2 later changes one line and nothing else notices — the same move that paid off on Day 4, when the controller talked to a repository interface and the HashMap-to-PostgreSQL swap left it untouched.
+
+### What a JWT actually is
+Three Base64 chunks joined by dots:
+```
+eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0QHNob3AuY29tIn0.7Kx2mQ...
+      header                 payload                  signature
+```
+The **header** names the algorithm. The **payload** holds the claims — who you are, when the token was issued, when it dies. The **signature** is an HMAC over the first two parts, computed with a secret only the server holds.
+
+### The payload is encoded, not encrypted
+This is the part almost everyone gets wrong. Anyone holding the token can decode the payload and read every claim — paste one into jwt.io and the data appears in plain text.
+
+The signature hides nothing. It proves nothing was **altered**: change one character of the payload and the recomputed signature stops matching, so the server rejects it.
+
+The rule that follows is absolute — never put a secret in a token. No passwords, no card numbers. `merchantId` is fine because an identifier is not a credential.
+
+### Standard claims versus custom claims
+`sub` (subject), `iat` (issued at) and `exp` (expiration) are RFC-standard, which is why jjwt gives them dedicated builder methods and checks `exp` automatically when parsing.
+
+`merchantId` is custom — an arbitrary key and value added by hand. It is the whole payoff over API keys: when a request arrives, the filter reads the merchant's identity straight out of the token, with no database lookup. That is what "stateless" means in practice, and why authentication cost stays flat as the merchant table grows.
+
+### Why the signing key is built once
+`Keys.hmacShaKeyFor(...)` sits in the constructor, not inside generateToken. Deriving a SecretKey from a string is real computation, and doing it per login would be waste. Build once at startup, reuse forever — the same instinct as the PasswordEncoder bean.
+
+The field is `final` for a reason beyond style: if the signing key could change at runtime, every token already issued would silently stop verifying.
+
+### Why the secret must be at least 32 characters
+HS256 needs a 256-bit key, and 256 ÷ 8 = 32 bytes. jjwt checks this at startup and throws WeakKeyException rather than quietly shipping weak crypto.
+
+The value is read as `${JWT_SECRET:default}` — Spring's syntax for "use the environment variable if it exists, otherwise fall back to this literal." The repository is public, so the committed value is a dev throwaway and says so in its own text; production sets the real secret as an environment variable that never touches Git.
+
+### Verification cannot be skipped
+```java
+Jwts.parser()
+    .verifyWith(key)      // not optional
+    .build()
+    .parseSignedClaims(token)
+    .getPayload();
+```
+There is no path in this API that hands back claims without checking the signature first. A tampered or expired token throws before anything downstream sees the data. The library removes the unsafe path rather than documenting it as a bad idea.
+
+### Maven runtime scope as an API guardrail
+jjwt ships as three artifacts. `jjwt-api` holds the interfaces and is compile scope, because my code imports from it. `jjwt-impl` and `jjwt-jackson` are **runtime** scope: on the classpath when the application runs, but invisible to the compiler. I therefore physically cannot import an internal class by accident. The build file is enforcing "code against the interface."
+
+These three carry explicit `<version>` tags, unlike every Spring dependency, because the parent POM only manages versions inside its own ecosystem and jjwt is not part of it.
+
+### jjwt 0.12 was a breaking release
+`setSubject`, `setExpiration`, `setSigningKey` and `parseClaimsJws` became `subject`, `expiration`, `verifyWith` and `parseSignedClaims`. Version 0.13.0 is API-identical to 0.12.x. Practical consequence: almost every JWT tutorial online predates the change and will not compile.
+
+### Two doors, and the trade-off between them
+| | API key (`tk_`) | JWT |
+|---|---|---|
+| Who holds it | the merchant's server | a human at a dashboard |
+| Lifetime | forever | one hour |
+| Carries a role | no | yes |
+| Verification | database lookup per request | local signature check |
+| Revocable | yes, delete the row | no, must wait for expiry |
+
+That last row is the honest cost and the standard interview follow-up. Stateless verification means there is no central place to declare a token dead. Short lifetimes are the mitigation; larger systems add refresh tokens or a revocation list, which reintroduces exactly the per-request state lookup that JWTs exist to avoid. It is a trade-off, not a free win.
+
+### Why hashing the API keys is not symmetric
+Day 7 left API keys in plain text, and BCrypt does not simply solve it.
+
+Verifying an API key means first *finding* the merchant it belongs to. A hash cannot be indexed, so the only option would be pulling every merchant and BCrypt-comparing against each at ~100ms apiece. A thousand merchants and the gateway falls over.
+
+Passwords escape this because login also sends an email: the email finds the row in one indexed query, and only then is a single hash comparison needed.
+
+The real fix is a **lookup prefix** — store the key as `tk_live_<lookup>_<secret>`, index the lookup half in plain text to find the row in one query, and hash only the secret half. This is what Stripe does.
