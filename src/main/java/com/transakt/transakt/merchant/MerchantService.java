@@ -1,6 +1,7 @@
 package com.transakt.transakt.merchant;
 
 import com.transakt.transakt.common.ResourceNotFoundException;
+import org.springframework.security.crypto.password.PasswordEncoder;   // ← NEW (1)
 import org.springframework.stereotype.Service;
 
 import java.time.Instant;
@@ -11,15 +12,23 @@ import java.util.UUID;
 public class MerchantService {
 
     private final MerchantRepository merchantRepository;
+    private final PasswordEncoder passwordEncoder;                     // ← NEW (2)
 
-    public MerchantService(MerchantRepository merchantRepository) {
+    public MerchantService(MerchantRepository merchantRepository,
+                           PasswordEncoder passwordEncoder) {          // ← NEW (3)
         this.merchantRepository = merchantRepository;
+        this.passwordEncoder = passwordEncoder;                        // ← NEW (3)
     }
 
     public Merchant create(Merchant merchant) {
         merchant.setId(UUID.randomUUID().toString());
         merchant.setApiKey("tk_" + UUID.randomUUID().toString().replace("-", ""));
         merchant.setCreatedAt(Instant.now());
+
+        if (merchant.getPassword() != null) {                          // ← NEW (4)
+            merchant.setPassword(passwordEncoder.encode(merchant.getPassword()));
+        }
+
         return merchantRepository.save(merchant);
     }
 

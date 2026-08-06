@@ -13,3 +13,7 @@ spring:
     properties:
       hibernate:
         format_sql: true
+
+jwt:
+  secret: ${JWT_SECRET:transakt-dev-secret-key-change-me-min-32-chars}
+  expiration-ms: 3600000

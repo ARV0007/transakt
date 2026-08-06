@@ -1,9 +1,7 @@
 package com.transakt.transakt.merchant;
 
-import jakarta.persistence.Column;
-import jakarta.persistence.Entity;
-import jakarta.persistence.Id;
-import jakarta.persistence.Table;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import jakarta.persistence.*;
 import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.NoArgsConstructor;
@@ -31,6 +29,13 @@ public class Merchant {
 
     @Column(name = "api_key", unique = true)
     private String apiKey;
+
+    @JsonProperty(access = JsonProperty.Access.WRITE_ONLY)
+    private String password;
+
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false)
+    private MerchantRole role = MerchantRole.MERCHANT;
 
     @Column(name = "created_at", updatable = false)
     private Instant createdAt;

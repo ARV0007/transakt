@@ -1,7 +1,9 @@
 package com.transakt.transakt.common;
 
+import com.transakt.transakt.auth.JwtAuthFilter;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
 import org.springframework.security.web.SecurityFilterChain;
@@ -11,9 +13,11 @@ import org.springframework.security.web.authentication.UsernamePasswordAuthentic
 public class SecurityConfig {
 
     private final ApiKeyFilter apiKeyFilter;
+    private final JwtAuthFilter jwtAuthFilter;
 
-    public SecurityConfig(ApiKeyFilter apiKeyFilter) {
+    public SecurityConfig(ApiKeyFilter apiKeyFilter, JwtAuthFilter jwtAuthFilter) {
         this.apiKeyFilter = apiKeyFilter;
+        this.jwtAuthFilter = jwtAuthFilter;
     }
 
     @Bean
@@ -22,10 +26,13 @@ public class SecurityConfig {
                 .csrf(AbstractHttpConfigurer::disable)
                 .authorizeHttpRequests(auth -> auth
                         .requestMatchers("/api/v1/health").permitAll()
-                        .requestMatchers("/api/v1/merchants/**").permitAll()
+                        .requestMatchers("/api/v1/auth/**").permitAll()
+                        .requestMatchers(HttpMethod.POST, "/api/v1/merchants").permitAll()
+                        .requestMatchers("/api/v1/merchants/**").hasRole("ADMIN")
                         .anyRequest().authenticated()
                 )
-                .addFilterBefore(apiKeyFilter, UsernamePasswordAuthenticationFilter.class);
+                .addFilterBefore(apiKeyFilter, UsernamePasswordAuthenticationFilter.class)
+                .addFilterBefore(jwtAuthFilter, ApiKeyFilter.class);
 
         return http.build();
     }
