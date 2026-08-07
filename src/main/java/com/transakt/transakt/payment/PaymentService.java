@@ -7,7 +7,6 @@ import com.transakt.transakt.ledger.LedgerEntryRepository;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-
 import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
@@ -52,11 +51,26 @@ public class PaymentService {
         return saved;
     }
 
-    public Payment getById(String id) {
-        return paymentRepository.findById(id)
-                .orElseThrow(() -> new ResourceNotFoundException("Payment not found: " + id));
+    public List<Payment> getAllForCaller(String callerMerchantId, boolean isAdmin) {
+        if (isAdmin) {
+            return paymentRepository.findAll();
+        }
+        return paymentRepository.findByMerchantId(callerMerchantId);
     }
-    public List<LedgerEntry> getLedgerForPayment(String paymentId) {
+
+    public Payment getById(String id, String callerMerchantId, boolean isAdmin) {
+        Payment payment = paymentRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("Payment not found: " + id));
+
+        if (!isAdmin && !payment.getMerchantId().equals(callerMerchantId)) {
+            throw new ResourceNotFoundException("Payment not found: " + id);
+        }
+
+        return payment;
+    }
+
+    public List<LedgerEntry> getLedgerForPayment(String paymentId, String callerMerchantId, boolean isAdmin) {
+        getById(paymentId, callerMerchantId, isAdmin);
         return ledgerEntryRepository.findByPaymentId(paymentId);
     }
 }

@@ -41,13 +41,15 @@ public class JwtAuthFilter extends OncePerRequestFilter {
 
                 String role = jwtService.extractRole(token);
 
+                String merchantId = jwtService.extractMerchantId(token);
+
                 List<SimpleGrantedAuthority> authorities =
                         (role == null)
                                 ? List.of()
                                 : List.of(new SimpleGrantedAuthority("ROLE_" + role));
 
                 UsernamePasswordAuthenticationToken auth =
-                        new UsernamePasswordAuthenticationToken(email, null, authorities);
+                        new UsernamePasswordAuthenticationToken(merchantId, null, authorities);
                 SecurityContextHolder.getContext().setAuthentication(auth);
 
             } catch (Exception e) {
