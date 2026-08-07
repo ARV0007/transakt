@@ -215,7 +215,7 @@ Spring Boot 4.1.0 had no matching spring-boot-starter-security. Pinning the star
 
 ---
 
-## Day 8 — Passwords and JSON Web Tokens
+## Day 8 — Passwords, JSON Web Tokens, and roles
 
 ### The problem
 Day 7 closed the payment API to machines, but there is still no way for a *person* to log in. A merchant who wants to open a dashboard and look at their own payments has no credential to offer — a Merchant row has a name, an email, and an API key, and nothing a human could type into a login form.
@@ -245,7 +245,7 @@ $2a$10$Wrs1LY3CQTEeu2uMI7QMU.ufs2d2/MChD46dl4m0doW7scVCLqP2i
 Always exactly 60 characters. A common production bug is setting the column to VARCHAR(20) while thinking about password *length*, which silently truncates every hash.
 
 ### @JsonProperty(WRITE_ONLY)
-`/api/v1/merchants` is still permitAll, so anyone on the internet can GET the list. Without this annotation Jackson would serialise the password field into every response and every hash in the system would be one public URL away.
+`POST /api/v1/merchants` is a public signup endpoint. Without this annotation Jackson would serialise the password field into every response, and every hash in the system would be one public URL away.
 
 WRITE_ONLY means Jackson accepts the field coming *in* from a request body and never writes it *out*. Same instinct as the Day 6 DTOs: make the unsafe thing structurally impossible rather than relying on remembering.
 
@@ -284,7 +284,7 @@ The rule that follows is absolute — never put a secret in a token. No password
 ### Standard claims versus custom claims
 `sub` (subject), `iat` (issued at) and `exp` (expiration) are RFC-standard, which is why jjwt gives them dedicated builder methods and checks `exp` automatically when parsing.
 
-`merchantId` is custom — an arbitrary key and value added by hand. It is the whole payoff over API keys: when a request arrives, the filter reads the merchant's identity straight out of the token, with no database lookup. That is what "stateless" means in practice, and why authentication cost stays flat as the merchant table grows.
+`merchantId` and `role` are custom — arbitrary key/value pairs added by hand. They are the whole payoff over API keys: when a request arrives, the filter reads the merchant's identity and permission level straight out of the token, with no database lookup. That is what "stateless" means in practice, and why authentication cost stays flat as the merchant table grows.
 
 ### Why the signing key is built once
 `Keys.hmacShaKeyFor(...)` sits in the constructor, not inside generateToken. Deriving a SecretKey from a string is real computation, and doing it per login would be waste. Build once at startup, reuse forever — the same instinct as the PasswordEncoder bean.
@@ -314,6 +314,73 @@ These three carry explicit `<version>` tags, unlike every Spring dependency, bec
 ### jjwt 0.12 was a breaking release
 `setSubject`, `setExpiration`, `setSigningKey` and `parseClaimsJws` became `subject`, `expiration`, `verifyWith` and `parseSignedClaims`. Version 0.13.0 is API-identical to 0.12.x. Practical consequence: almost every JWT tutorial online predates the change and will not compile.
 
+### Don't overload a method that makes different guarantees
+While adding the role claim I briefly had two `generateToken` methods — a two-argument one and a three-argument one. Java allows it, and it compiles, but the two produce *different kinds of token*: one carries a role, one does not. At a call site they look interchangeable.
+
+Calling the old one by accident would have minted a token that authenticates perfectly and has no role, so every admin endpoint would return 403 with no visible cause. Deleting the old method turned that silent runtime bug into a compile error naming the exact line. Overloading is for "same job, different inputs" — not "same name, different guarantees."
+
+### The login endpoint
+Login does three things: find the merchant by email in one indexed query, check the password, mint a token.
+
+The password check runs in a direction worth being precise about. `passwordEncoder.matches(raw, storedHash)` does not decrypt anything — BCrypt is one-way and cannot be reversed. It pulls the salt out of the stored hash, hashes the incoming plaintext with that same salt and cost factor, and compares the two results. Argument order matters: raw first, stored hash second. Swap them and it silently returns false forever.
+
+The endpoint must be `permitAll`. `anyRequest().authenticated()` would otherwise block it, and you would need a token to obtain a token — the same circular bootstrap that already applies to merchant signup.
+
+### Why both failure paths return the same message
+Wrong password and unknown email both throw `InvalidCredentialsException("Invalid email or password")`. Never "no such user" versus "wrong password".
+
+Distinct messages let an attacker feed in a list of addresses and learn which ones are registered, purely from which error comes back. That is **email enumeration**, and it is a routine finding in security audits — the information leak is not the password, it is the fact that an account exists at all.
+
+There is a subtler version of the same leak that the generic message does not close. When the email does not exist, the method returns immediately. When it does, a ~100ms BCrypt comparison runs first. An attacker timing the responses can still tell the difference. Real systems run a dummy BCrypt comparison against a throwaway hash in the not-found branch so both paths take roughly the same time. Not implemented here, but worth knowing — it is the answer that shows you thought past the obvious one.
+
+### 401 versus 403, revisited
+A failed login returns **401**. Identity was never established, so the honest answer is "I don't know who you are." A caller who authenticated correctly but lacks the role gets **403** — "I know exactly who you are, and no."
+
+### The Bearer scheme
+The `Authorization` header supports several schemes: `Basic`, `Digest`, `Bearer`. The prefix tells the server how to interpret what follows, which is why the filter checks `startsWith("Bearer ")` and then takes `substring(7)` — seven characters for `Bearer` plus the space.
+
+`Bearer` means literally that: whoever bears this token is treated as its owner, no further proof required. That is why a leaked token is as good as a password until it expires, and why the expiry is short.
+
+### Why the auth filter never rejects
+`JwtAuthFilter` has no 401s, no 403s, no early returns. Its only job is: *if a valid token is present, record who it belongs to.* No token or a bad one, and it does nothing — the request continues, still unauthenticated.
+
+Deciding whether an unauthenticated request is allowed belongs to `SecurityConfig`. That separation is why two filters can share one chain without either knowing the other's rules.
+
+The try/catch is not defensive padding either. An expired token throws `ExpiredJwtException`; a tampered one throws `SignatureException`. Let either escape and Spring returns a 500 with a stack trace — which is both ugly and a small information leak, since the error text tells an attacker whether their forgery failed on the signature or on the expiry.
+
+### Filter order, stated rather than inherited
+Both filters go into the chain with `addFilterBefore`. The second call anchors to `ApiKeyFilter.class` rather than to `UsernamePasswordAuthenticationFilter.class` again, which fixes the relative order in writing instead of leaving it to insertion mechanics.
+
+Both filters also guard on `SecurityContextHolder.getContext().getAuthentication() == null`, so whichever runs second cannot overwrite the first one's work. No request carries both credentials today, which is precisely why that bug would have surfaced in six months rather than now.
+
+### Roles, and the prefix that is not optional
+Spring Security has a convention that is easy to miss and expensive to get wrong:
+
+> `hasRole("ADMIN")` looks for an authority literally named `ROLE_ADMIN`.
+
+It prepends the prefix when checking, so you must write it when creating: `new SimpleGrantedAuthority("ROLE_" + role)`. Store plain `"ADMIN"` and every check fails silently — no exception, no warning, just a 403 with nothing to explain it.
+
+The null guard matters too. Any token minted before the role claim existed returns `null` from `extractRole`, and `"ROLE_" + null` produces the authority `"ROLE_null"` — an authentication that looks entirely valid and matches nothing. An empty authorities list is the honest answer: authenticated, no role.
+
+The role itself is a `MerchantRole` enum with a field initialiser defaulting to `MERCHANT`, so a client cannot choose its own permission level any more than it can choose its own id. Converting it to a String for the claim uses `.name()` rather than `.toString()` — they are identical for a plain enum, but `toString()` can be overridden by anyone editing the enum later while `name()` is guaranteed by the language. When a value drives permission checks, take the one that cannot change by accident.
+
+### Splitting a path by HTTP method
+Since Day 7, `/api/v1/merchants/**` was `permitAll` — meaning anyone on the internet could list, edit or delete every merchant. The reason was real (a merchant must exist before it can hold a key) but the fix was too broad: "signup must be open" got applied to the whole path.
+
+The correction splits by method:
+
+```java
+.requestMatchers(HttpMethod.POST, "/api/v1/merchants").permitAll()
+.requestMatchers("/api/v1/merchants/**").hasRole("ADMIN")
+```
+
+Two details. **Order is load-bearing** — Spring evaluates top to bottom and first match wins, so the POST rule must come first or the ADMIN rule swallows signup and the bootstrap problem returns. And the POST line has **no `/**`**: `/api/v1/merchants` matches that exact path only, while `/api/v1/merchants/**` matches it and everything beneath. Signup is one endpoint; the admin rule is a subtree.
+
+### `ddl-auto: update` and the NOT NULL problem
+Adding `role` as a `NOT NULL` column failed at startup: Postgres will not add one to a table that already has rows, because there is nothing to put in them. The Java-side default (`= MerchantRole.MERCHANT`) does not help — it only runs when a new object is constructed, never for rows already on disk.
+
+The fix was three manual steps: add the column as nullable, `UPDATE` every existing row, restart so Hibernate can apply the constraint. In production this is one Flyway migration — versioned, committed, applied identically everywhere. `ddl-auto: update` is a learning convenience, and this is the moment its limits show.
+
 ### Two doors, and the trade-off between them
 | | API key (`tk_`) | JWT |
 |---|---|---|
@@ -325,6 +392,13 @@ These three carry explicit `<version>` tags, unlike every Spring dependency, bec
 
 That last row is the honest cost and the standard interview follow-up. Stateless verification means there is no central place to declare a token dead. Short lifetimes are the mitigation; larger systems add refresh tokens or a revocation list, which reintroduces exactly the per-request state lookup that JWTs exist to avoid. It is a trade-off, not a free win.
 
+### Two filters, two staleness guarantees
+The same permission model behaves differently depending on which door a caller uses.
+
+`ApiKeyFilter` reads the role from a **fresh database row** on every request, so demoting a merchant takes effect immediately. `JwtAuthFilter` reads it from the **token**, so a demotion changes nothing until that token expires — up to an hour later.
+
+That is the revocation trade-off above, no longer an abstraction but a property of code in this repository.
+
 ### Why hashing the API keys is not symmetric
 Day 7 left API keys in plain text, and BCrypt does not simply solve it.
 
@@ -333,3 +407,106 @@ Verifying an API key means first *finding* the merchant it belongs to. A hash ca
 Passwords escape this because login also sends an email: the email finds the row in one indexed query, and only then is a single hash comparison needed.
 
 The real fix is a **lookup prefix** — store the key as `tk_live_<lookup>_<secret>`, index the lookup half in plain text to find the row in one query, and hash only the secret half. This is what Stripe does.
+
+---
+
+## Day 9 — Ownership: "is this your data?"
+
+### The problem
+Day 8 finished with two questions answered and one still open.
+
+**Authentication** answers *who are you* — a signed token, a valid API key.
+**Role authorization** answers *what kind of user are you* — MERCHANT or ADMIN.
+**Ownership authorization** answers *is this record yours* — and nothing in the system asked it.
+
+A merchant holding a completely legitimate token, with a correct MERCHANT role and a valid signature, could send `merchantId` in a payment body and file a transaction under someone else's account. Every check passed, because every check was about role.
+
+The reads were worse. `GET /api/v1/payments/{id}` returned any payment to any authenticated caller. Sign up for a free account, get a token, start walking IDs: amounts, timing, volume, the whole book. The create hole was a data-integrity bug. The read hole was a breach.
+
+### Unify the principal first
+Nothing else could work until the two filters agreed on what identity means. `ApiKeyFilter` set the merchant's UUID as the principal; `JwtAuthFilter` set the email. So `getAuthentication().getName()` returned different shapes depending on which door the caller used, and any ownership comparison would have silently failed for every JWT caller — comparing an email address against a UUID.
+
+Merchant ID wins, because emails change and IDs don't. `JwtService` gained `extractMerchantId`, reading a claim that had been sitting in every token since Day 8 and had never been read.
+
+### Delete the field, don't validate it
+The obvious fix for the create hole is an if-check: compare the body's `merchantId` against the caller and throw if they differ.
+
+The better fix is to remove `merchantId` from `CreatePaymentRequest` entirely. The authenticated caller **is** the merchant — the server already knows. Asking the client to tell you, then verifying the answer, is work that doesn't need doing.
+
+Same instinct as Day 3's server-controlled `id` and Day 6's DTO that structurally cannot carry `status`. Applied here to identity rather than to a field.
+
+The difference shows up in the test. Send a forged `merchantId` now and the response is **200**, not 400 — Jackson looks for a field to bind that key to, finds none, and drops it. The request isn't rejected; it's unaffected. A validation check can be forgotten by the next endpoint or lost in a refactor. A field that doesn't exist can't be exploited by anyone, including future-me.
+
+### `Authentication` as a method parameter
+```java
+public Payment create(@Valid @RequestBody CreatePaymentRequest request,
+                      Authentication authentication) {
+```
+Spring MVC recognises the type and resolves it from the SecurityContext — the same context the filters wrote to milliseconds earlier. No annotation, no injection, no `SecurityContextHolder` call. Declare the parameter and it's there.
+
+`getName()` returns the **principal**: the first argument the filters passed to `UsernamePasswordAuthenticationToken`. Which is exactly why unifying it had to come first.
+
+### Why the controller reads it and the service doesn't
+The identity arrives with the request, so the controller — whose job is HTTP concerns — pulls it out and hands the service a plain `String` and a `boolean`. The service then knows nothing about Spring Security, stays unit-testable without standing up a security context, and the Day 3 layering rule holds.
+
+### 404, not 403
+When a merchant asks for a payment that isn't theirs, there are two defensible answers.
+
+**403 Forbidden** — "that exists, it's not yours." Accurate and easy to debug.
+
+**404 Not Found** — "nothing here." A small lie, and the safer one.
+
+A 403 *confirms the ID is real*, which is precisely what someone enumerating IDs wants to learn. A 404 is indistinguishable from a genuinely missing record, so walking IDs teaches them nothing.
+
+Stripe returns 404. So does GitHub for private repositories — a repo you can't see looks like it doesn't exist rather than announcing itself.
+
+The implementation detail that makes it work: **both throws use the identical message.** `"Payment not found: " + id` whether the row is missing or merely not yours. Change one of them to "not yours" and the whole protection is undone.
+
+### The rule lives in one place
+`getLedgerForPayment` calls `getById` and discards the result:
+
+```java
+public List<LedgerEntry> getLedgerForPayment(String paymentId, String callerMerchantId, boolean isAdmin) {
+    getById(paymentId, callerMerchantId, isAdmin);
+    return ledgerEntryRepository.findByPaymentId(paymentId);
+}
+```
+
+It reads oddly and is deliberate: *check I'm allowed, then fetch.* The alternative is copying the ownership condition into a second method, and rules that live in two places drift apart.
+
+This endpoint was also the quiet danger. Before Day 9 it went straight to `ledgerEntryRepository` and never touched the payments table — a `LedgerEntry` knows its `paymentId`, not its merchant, so it had no concept of ownership at all. Easy to secure the obvious endpoint and leave its neighbour open, because `/ledger` *reads* like it's about ledger entries rather than payments.
+
+### Fetch-then-check versus scope-the-query
+For a **single** resource, load it and then reject: `getById` fetches the payment, compares owners, throws if it isn't yours.
+
+For a **collection**, checking after the fact doesn't work. You would load every payment in the database and filter in Java — slow, memory-hungry, and the data has already left the database before you decided the caller shouldn't have it.
+
+Instead the query itself is scoped:
+
+```java
+public List<Payment> getAllForCaller(String callerMerchantId, boolean isAdmin) {
+    if (isAdmin) {
+        return paymentRepository.findAll();
+    }
+    return paymentRepository.findByMerchantId(callerMerchantId);
+}
+```
+
+Two different queries, chosen by role, with no filtering step anywhere. The rows a merchant isn't allowed to see never load. That's the difference between an authorization *check* and an authorization *boundary*.
+
+`findByMerchantId` is another derived query — the method name is the query, same trick as `findByPaymentId` on Day 5 and `findByEmail` on Day 8.
+
+### Two `@GetMapping` annotations on one class
+`@GetMapping` with no path maps to the class-level `/api/v1/payments`; `@GetMapping("/{id}")` maps to anything beneath it. Spring resolves by **pattern specificity**, so declaration order doesn't matter here.
+
+Worth contrasting with `SecurityConfig`, where `authorizeHttpRequests` is **first-match-wins** and order is load-bearing. Two configuration systems in the same framework, two different resolution rules.
+
+### Known limitation: no pagination
+`findAll()` has no limit. Ten payments is fine; ten million would try to load every row into memory and serialise it.
+
+Real APIs paginate — `GET /payments?page=0&size=20`. Spring Data supports it directly: change the return type to `Page<Payment>`, accept a `Pageable` parameter, and the framework generates the `LIMIT`/`OFFSET`. An interviewer who sees an unpaginated list endpoint will ask about it, and "I know, here's what it would take" is a much better answer than not having noticed.
+
+### A debugging habit worth keeping
+Twice during testing, a request that had worked minutes earlier returned 403, and both times the instinct was to suspect the new code. Both times the token had passed its one-hour expiry — once by 89 minutes.
+
+On this API a sudden 403 means **check the token age first.** The code did not change between the two requests; the clock did.
