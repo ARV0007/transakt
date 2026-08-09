@@ -14,10 +14,14 @@ public class SecurityConfig {
 
     private final ApiKeyFilter apiKeyFilter;
     private final JwtAuthFilter jwtAuthFilter;
+    private final RateLimitFilter rateLimitFilter;
 
-    public SecurityConfig(ApiKeyFilter apiKeyFilter, JwtAuthFilter jwtAuthFilter) {
+    public SecurityConfig(ApiKeyFilter apiKeyFilter,
+                          JwtAuthFilter jwtAuthFilter,
+                          RateLimitFilter rateLimitFilter) {
         this.apiKeyFilter = apiKeyFilter;
         this.jwtAuthFilter = jwtAuthFilter;
+        this.rateLimitFilter = rateLimitFilter;
     }
 
     @Bean
@@ -32,7 +36,8 @@ public class SecurityConfig {
                         .anyRequest().authenticated()
                 )
                 .addFilterBefore(apiKeyFilter, UsernamePasswordAuthenticationFilter.class)
-                .addFilterBefore(jwtAuthFilter, ApiKeyFilter.class);
+                .addFilterBefore(jwtAuthFilter, ApiKeyFilter.class)
+                .addFilterAfter(rateLimitFilter, ApiKeyFilter.class);
 
         return http.build();
     }

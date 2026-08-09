@@ -13,7 +13,14 @@ spring:
     properties:
       hibernate:
         format_sql: true
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
 
 jwt:
   secret: ${JWT_SECRET:transakt-dev-secret-key-change-me-min-32-chars}
   expiration-ms: 3600000
+
+ratelimit:
+  requests-per-minute: ${RATE_LIMIT_PER_MINUTE:20}

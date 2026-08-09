@@ -1,5 +1,7 @@
 package com.transakt.transakt.payment;
 
+import com.transakt.transakt.common.IdempotencyConflictException;
+import com.transakt.transakt.common.IdempotencyService;
 import com.transakt.transakt.ledger.LedgerEntry;
 import jakarta.validation.Valid;
 import org.springframework.security.core.Authentication;
@@ -12,19 +14,50 @@ import java.util.List;
 public class PaymentController {
 
     private final PaymentService paymentService;
+    private final IdempotencyService idempotencyService;
 
-    public PaymentController(PaymentService paymentService) {
+    public PaymentController(PaymentService paymentService,
+                             IdempotencyService idempotencyService) {
         this.paymentService = paymentService;
+        this.idempotencyService = idempotencyService;
     }
 
     @PostMapping
     public Payment create(@Valid @RequestBody CreatePaymentRequest request,
+                          @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey,
                           Authentication authentication) {
+
+        String merchantId = authentication.getName();
+
+        if (idempotencyKey == null || idempotencyKey.isBlank()) {
+            return paymentService.create(buildPayment(request, merchantId));
+        }
+
+        if (!idempotencyService.tryReserve(merchantId, idempotencyKey)) {
+            String stored = idempotencyService.getStoredValue(merchantId, idempotencyKey);
+            if (stored == null || IdempotencyService.IN_PROGRESS.equals(stored)) {
+                throw new IdempotencyConflictException(
+                        "A request with this Idempotency-Key is already in progress");
+            }
+            return paymentService.getById(stored, merchantId, false);
+        }
+
+        try {
+            Payment saved = paymentService.create(buildPayment(request, merchantId));
+            idempotencyService.storeResult(merchantId, idempotencyKey, saved.getId());
+            return saved;
+        } catch (RuntimeException e) {
+            idempotencyService.release(merchantId, idempotencyKey);
+            throw e;
+        }
+    }
+
+    private Payment buildPayment(CreatePaymentRequest request, String merchantId) {
         Payment payment = new Payment();
-        payment.setMerchantId(authentication.getName());
+        payment.setMerchantId(merchantId);
         payment.setAmountPaise(request.getAmountPaise());
         payment.setCurrency(request.getCurrency());
-        return paymentService.create(payment);
+        return payment;
     }
 
     @GetMapping
