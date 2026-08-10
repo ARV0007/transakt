@@ -1,24 +1,30 @@
 # Transakt Architecture
 
-## Current: v0.9 — Ownership authorization (Day 9)
+## Current: v1.0 — Idempotency and rate limiting (Day 10)
 
 ```mermaid
 flowchart TD
   server[Merchant server - a machine]
   human[Merchant dashboard - a human]
-  server -->|X-API-Key| tomcat[Embedded Tomcat :8080]
+  server -->|X-API-Key plus Idempotency-Key| tomcat[Embedded Tomcat :8080]
   human -->|Authorization Bearer token| tomcat
   tomcat --> jaf[JwtAuthFilter - verifies HMAC in memory]
   jaf --> akf[ApiKeyFilter - resolves key to merchant]
   akf --> lookup[(merchants table - findByApiKey)]
   jaf --> ctx[SecurityContext - merchantId plus ROLE authority]
   lookup --> ctx
-  ctx --> dispatcher[DispatcherServlet]
+  ctx --> rlf[RateLimitFilter - INCR per merchant per minute]
+  rlf -->|over limit - 429| reject[Request stops here]
+  rlf --> dispatcher[DispatcherServlet]
   dispatcher --> ac[AuthController - open]
   dispatcher --> health[HealthController - open]
   dispatcher --> mc[MerchantController - POST open, rest ADMIN only]
-  dispatcher --> pc[PaymentController - reads caller identity from SecurityContext]
-  dispatcher -.->|exceptions| geh[GlobalExceptionHandler - 400 401 404]
+  dispatcher --> pc[PaymentController - identity from SecurityContext, idempotency orchestration]
+  dispatcher -.->|exceptions| geh[GlobalExceptionHandler - 400 401 404 409]
+  pc --> idem[IdempotencyService - SET NX EX]
+  rlf --> rate[RateLimitService - INCR plus TTL]
+  idem --> redis[(Redis - keys with TTL)]
+  rate --> redis
   ac --> as[AuthService]
   as --> js[JwtService]
   as --> pe[PasswordEncoder - BCrypt]
@@ -32,31 +38,37 @@ flowchart TD
   lr --> db
 ```
 
-**How a request flows:** Tomcat parses the HTTP request. Two filters run before any controller. `JwtAuthFilter` looks for an `Authorization: Bearer` header and, if the signature verifies and the token has not expired, records the caller's merchant ID and role in the SecurityContext — with no database access at all. `ApiKeyFilter` then looks for `X-API-Key` and, if the SecurityContext is still empty, resolves the key to a merchant row and does the same. Neither filter ever rejects a request; refusal is `SecurityConfig`'s job. The DispatcherServlet routes to the right controller. Controllers read the caller's identity from the SecurityContext and hand it to services as plain values, so services stay free of Spring Security types. `PaymentService` is `@Transactional` on writes: creating a payment writes the payment row plus two balancing ledger entries as one atomic unit.
+**How a request flows:** Tomcat parses the HTTP request. Three filters run before any controller. `JwtAuthFilter` looks for an `Authorization: Bearer` header and, if the signature verifies and the token has not expired, records the caller's merchant ID and role in the SecurityContext with no database access. `ApiKeyFilter` then looks for `X-API-Key` and, if the context is still empty, resolves the key to a merchant row and does the same. `RateLimitFilter` runs last of the three — deliberately, because it needs an identity to count against — and refuses the request outright with 429 if that merchant has exceeded its per-minute allowance. The DispatcherServlet then routes to a controller. Controllers read the caller's identity from the SecurityContext and hand services plain values, so services stay free of Spring Security types. `PaymentService` is `@Transactional` on writes: a payment plus its two balancing ledger entries commit together or not at all.
 
-**Three layers of authorization (v0.9):** the system now answers three separate questions, and each needed its own mechanism. *Who are you* is authentication — a signed token or a valid API key. *What kind of user are you* is role authorization — `hasRole("ADMIN")` on a path. *Is this record yours* is ownership authorization, and neither of the first two touches it. Before v0.9 a merchant with a perfectly valid token and a correct MERCHANT role could read any payment in the system by ID.
+**Two state stores, on purpose (v1.0):** PostgreSQL holds the truth — merchants, payments, ledger entries, all durable and queryable. Redis holds facts that matter intensely for a short time and then never again: idempotency keys for 24 hours, rate-limit counters for 60 seconds. Redis's TTL means both expire themselves, with no scheduled cleanup job anywhere in the codebase. The trade-off accepted knowingly is durability — Redis is in-memory and a restart loses its contents, which for a rate-limit counter is harmless and for an idempotency key opens a brief window in which a retry could double-charge. Systems that cannot tolerate that store idempotency keys in the database with a unique index and pay the latency.
 
-**Identity is never taken from the request body (v0.9):** `CreatePaymentRequest` has no `merchantId` field. The controller takes an `Authentication` parameter — resolved by Spring MVC directly from the SecurityContext — and sets the merchant ID from `getName()`. A client that sends a forged `merchantId` gets a 200 and a payment filed under its own account, because Jackson has nowhere to bind the key and drops it. The lie is not rejected; it is impossible. This required first unifying the principal: `JwtAuthFilter` previously set the email while `ApiKeyFilter` set the UUID, so `getName()` returned different shapes depending on which door the caller used. Merchant ID won, because emails change.
+**Idempotency (v1.0):** `POST /api/v1/payments` accepts an optional `Idempotency-Key` header. The controller reserves the key with an atomic `SET NX EX` under `idem:<merchantId>:<clientKey>`, creates the payment, then overwrites the reservation with the payment ID. A retry carrying the same key gets the **original payment** back — same id, same createdAt — rather than creating a second one. A duplicate arriving while the original is still in flight finds `IN_PROGRESS` and receives **409 Conflict**. A failed creation releases the reservation, so a transient error does not lock the merchant out of that key for a day. The atomicity is the point: checking whether a key exists and then setting it is two operations, and two simultaneous retries can both pass the check. Keys are scoped by merchant because clients choose their own key strings and two merchants could independently pick the same one.
 
-**Reads return 404, not 403 (v0.9):** when a merchant requests a payment that is not theirs, `PaymentService` throws `ResourceNotFoundException` with the same message it uses for a genuinely missing row. A 403 would confirm the ID is real, which is exactly the signal an attacker enumerating IDs is looking for. Stripe and GitHub behave the same way. The ledger endpoint delegates to `getById` before fetching entries, so the ownership rule lives in exactly one method — necessary because a `LedgerEntry` knows its `paymentId` but not its merchant, and before v0.9 that endpoint never touched the payments table at all.
+**The orchestration lives in the controller, not the service (v1.0)** — partly because idempotency is an HTTP concern driven by a header and expressed in status codes, but chiefly because a service method calling its own `@Transactional` method would bypass Spring's proxy entirely and run with no transaction at all. Self-invocation defeats proxy-based annotations, silently.
 
-**Collections are scoped, not filtered (v0.9):** `GET /api/v1/payments` returns `findByMerchantId(caller)` for a merchant and `findAll()` for an admin. There is no filtering step — rows the caller may not see are never loaded. For a single resource, fetch-then-check is fine; for a collection, checking after the fact would mean pulling every payment into memory and discarding most of it, which is both slower and a data-handling risk.
+**Rate limiting (v1.0):** `RateLimitService` uses `INCR` on `rate:<merchantId>:<epochMinute>` with a 60-second TTL set only on the first increment, since overwriting a Redis value clears its expiry. Because the current minute is part of the key name, a new window creates a fresh counter automatically and the old one expires itself — there is no reset logic in the code. Past twenty requests per minute the filter returns **429 Too Many Requests**. Unlike the authentication filters, this one rejects rather than merely recording, and it writes its JSON response by hand: filters run before the DispatcherServlet, so `@RestControllerAdvice` cannot catch anything they throw.
 
-**Two authentication paths, on purpose (v0.8):** an API key belongs to a machine — the merchant's server, which sends the same permanent credential forever. A JWT belongs to a human, expires in an hour, and carries a role. The API-key path must query `merchants` on every request to answer "is this credential real?"; the JWT path answers the same question by recomputing an HMAC in memory, so authentication cost stays flat as merchant count grows. The trade-off is revocation: a JWT cannot be invalidated before it expires, which is why the lifetime is one hour.
+**Three layers of authorization (v0.9):** the system answers three separate questions, and each needed its own mechanism. *Who are you* is authentication — a signed token or a valid API key. *What kind of user are you* is role authorization — `hasRole("ADMIN")` on a path. *Is this record yours* is ownership authorization, and neither of the first two touches it. `CreatePaymentRequest` has no `merchantId` field at all, so a client cannot file a payment under another account — the lie has nowhere to land. Reads of a foreign payment return **404 rather than 403**, because a 403 would confirm the ID is real and hand an enumerator exactly the signal they want; both cases return an identical message, which is what makes it work. Collections are **scoped rather than filtered**: `findByMerchantId(caller)` for a merchant, `findAll()` for an admin, so unauthorised rows never load. This required first unifying the principal: `JwtAuthFilter` previously set the email while `ApiKeyFilter` set the UUID, so `getName()` returned different shapes depending on which door the caller used. Merchant ID won, because emails change.
 
-**Passwords and roles (v0.8):** merchants have a BCrypt-hashed password, cost factor 10 — deliberately slow, automatically salted, and annotated `@JsonProperty(WRITE_ONLY)` so it is accepted on input and never serialised out. Every merchant has a `MerchantRole` of `MERCHANT` or `ADMIN`, defaulted by a field initialiser so a client cannot choose its own permission level. The role travels as a token claim and becomes a Spring authority named `ROLE_ADMIN` or `ROLE_MERCHANT` — the prefix is mandatory, since `hasRole("ADMIN")` prepends it when checking.
+**Two authentication paths, on purpose (v0.8):** an API key belongs to a machine that sends the same permanent credential forever; a JWT belongs to a human, expires in an hour, and carries a role. The API-key path must query `merchants` on every request; the JWT path recomputes an HMAC in memory, so authentication cost stays flat as merchant count grows. The trade-off is revocation: a JWT cannot be invalidated before it expires, which is why the lifetime is short.
 
-**Validation and error handling (v0.6):** clients send DTOs exposing only the fields they may set. Bean Validation enforces rules such as "amount must be positive". A single `GlobalExceptionHandler` turns every exception into small, consistent JSON with the correct status code — 400 for validation, 401 for bad credentials, 404 for missing or inaccessible resources — so stack traces never leak.
+**Passwords and roles (v0.8):** BCrypt at cost factor 10 — deliberately slow, automatically salted, and annotated `@JsonProperty(WRITE_ONLY)` so it is accepted on input and never serialised out. Every merchant has a `MerchantRole` defaulted by a field initialiser, carried as a token claim, and converted into a Spring authority named `ROLE_ADMIN` or `ROLE_MERCHANT` — the prefix is mandatory, since `hasRole("ADMIN")` prepends it when checking.
 
-**The double-entry ledger (v0.5):** a payment never updates a stored balance. It appends two `LedgerEntry` rows — a CREDIT to the merchant account and an equal DEBIT from the gateway account. The two are equal and opposite, so the books always net to zero. Entries are append-only. Money is stored as integer paise, never a decimal.
+**Validation and error handling (v0.6):** clients send DTOs exposing only the fields they may set. Bean Validation enforces rules such as "amount must be positive". A single `GlobalExceptionHandler` turns every exception into consistent JSON with the right status code — 400 validation, 401 bad credentials, 404 missing or inaccessible, 409 idempotency conflict — so stack traces never leak.
+
+**The double-entry ledger (v0.5):** a payment never updates a stored balance. It appends two `LedgerEntry` rows — a CREDIT to the merchant account and an equal DEBIT from the gateway account. They are equal and opposite, so the books always net to zero and corruption is detectable. Entries are append-only. Money is integer paise, never a decimal.
 
 **Known limitations:**
 
-- **No pagination.** `GET /api/v1/payments` returns every matching row. Real APIs paginate; Spring Data supports it directly via `Page<Payment>` and a `Pageable` parameter.
+- **Unauthenticated traffic is not rate limited.** The filter guards on an existing identity, so brute-forcing `/auth/login` hits no ceiling. Production gateways add an IP-keyed limiter.
+- **Fixed-window rate limiting allows a boundary burst** — twenty requests either side of a minute boundary is forty in two seconds. Sliding windows via sorted sets fix it at more complexity.
+- **Idempotency keys are not fingerprinted against the request body.** Reusing a key with a different amount returns the original payment silently; Stripe returns 422 instead.
+- **No automated tests.** Everything is verified by hand.
+- **No pagination.** `GET /api/v1/payments` returns every matching row. Spring Data supports it via `Page<Payment>` and a `Pageable` parameter.
 - **API keys are stored in plain text.** Hashing them is not symmetric with hashing passwords: verifying a key means *finding* the row it belongs to, and a hash cannot be indexed. The fix is a lookup prefix — `tk_live_<lookup>_<secret>` — indexing the lookup half and hashing only the secret half.
-- **Schema changes are manual.** Adding the `NOT NULL` role column failed under `ddl-auto: update` and required a hand-written backfill. Production would use Flyway.
+- **Schema changes are manual** under `ddl-auto: update`. Production would use Flyway.
 - **No merchant-scoped ledger listing.** Ledger entries are reachable only through their parent payment.
-- `POST /api/v1/merchants` returns 200; REST convention is 201 with a `Location` header. There is no password-change endpoint.
+- `POST /api/v1/merchants` returns 200; REST convention is 201 with a `Location` header. There is no password-change endpoint and no `Retry-After` on 429s.
 
 ## Version log
 | Version | Day | What changed |
@@ -70,3 +82,4 @@ flowchart TD
 | v0.7 | 7 | API key authentication via a Spring Security filter. |
 | v0.8 | 8 | BCrypt passwords, JWT login, a second auth filter, and role-based access control. |
 | v0.9 | 9 | Ownership authorization: identity taken from the token, 404 on foreign resources, scoped collection queries. |
+| **v1.0** | **10** | **Redis. Idempotency keys prevent double charges; per-merchant rate limiting.** |

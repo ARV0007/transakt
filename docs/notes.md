@@ -510,3 +510,234 @@ Real APIs paginate — `GET /payments?page=0&size=20`. Spring Data supports it d
 Twice during testing, a request that had worked minutes earlier returned 403, and both times the instinct was to suspect the new code. Both times the token had passed its one-hour expiry — once by 89 minutes.
 
 On this API a sudden 403 means **check the token age first.** The code did not change between the two requests; the clock did.
+
+---
+
+## Day 10 — Idempotency and rate limiting with Redis
+
+### The problem
+
+A merchant's server sends `POST /api/v1/payments`. The payment is created, the ledger entries are written, the transaction commits — and the connection drops before the response gets back.
+
+The merchant's server now knows nothing. Did it work? There is no way to tell from where it stands. So it does the correct thing and retries.
+
+**The customer is charged twice.**
+
+This is not a rare edge case. Timeouts happen constantly at scale, retrying is proper client behaviour, and a double charge is the most damaging bug a payment gateway can ship.
+
+Note which HTTP method is involved. `GET`, `PUT` and `DELETE` are naturally safe to repeat — doing them twice has the same effect as once. That property is called **idempotent**. `POST` is the one that isn't, which is precisely why it needs help.
+
+### What Redis is, and what it is not
+
+An **in-memory key-value store**. You put a value under a name and get it back by that name. No tables, no columns, no joins, no SQL.
+
+It is not a replacement for PostgreSQL:
+
+| | PostgreSQL | Redis |
+|---|---|---|
+| Lives in | disk | RAM |
+| Speed | milliseconds | microseconds |
+| Structure | tables, relations, queries | keys and values |
+| Survives a crash | yes | not by default |
+| Good for | the truth | fast, short-lived facts |
+
+Extending the restaurant analogy: **Postgres is the fridge** — everything real is kept there and losing it is a disaster. **Redis is the notepad by the till** where the head waiter scribbles *"table 5 already ordered the fish."* Instantly checkable, and if the notepad burns you can rebuild from the kitchen tickets — but you'd rather not.
+
+Idempotency keys fit that shape exactly. They matter intensely for about 24 hours and then never again.
+
+### TTL: storage that cleans itself
+
+```
+SETEX temp 10 "this dies soon"
+TTL temp        → 7
+GET temp        → (nil)   after ten seconds
+```
+
+Redis deleted it. No cron job, no cleanup script, no scheduled task. That property is the main reason idempotency keys live here rather than in Postgres, where expiring old rows would need a job somebody has to write, run and monitor.
+
+### `SET ... NX` — the whole mechanism in one command
+
+```
+SET order123 "payment-abc" NX EX 86400   → OK
+SET order123 "payment-abc" NX EX 86400   → (nil)
+```
+
+- **`NX`** — set only if the key does **N**ot e**X**ist
+- **`EX 86400`** — expire in 24 hours
+
+`OK` means *"you're the first, go ahead."* `nil` means *"someone already did this."* That is the duplicate detector, complete.
+
+### Why not `EXISTS` then `SET`
+
+The obvious implementation:
+
+```java
+if (redis.exists(key)) { return existing; }
+redis.set(key, value);
+createPayment();
+```
+
+This has a **race condition**. Two retries arrive in the same millisecond. Both run `exists`, both get "no", both proceed. **Two payments.** A duplicate-prevention system that fails under exactly the conditions it exists for.
+
+`SET ... NX` performs the check and the write as **one atomic operation**. Redis executes commands one at a time, so there is no gap for a second request to slip into. Exactly one caller can receive `OK`.
+
+"Check then act" is one of the most common shapes of real production bug, and learning to recognise it is worth more than the Redis syntax.
+
+### The two-phase dance
+
+When the first request arrives there is no payment ID yet, because the payment hasn't been created. So the reservation holds a placeholder:
+
+1. **Reserve** — `SET key "IN_PROGRESS" NX EX 86400`
+2. **Create the payment**
+3. **Overwrite** the key with the real payment ID
+
+A later retry does a `GET` and finds one of three things:
+
+| Value | Meaning | Response |
+|---|---|---|
+| nothing | first time | create the payment |
+| a payment ID | already done | return **that** payment |
+| `IN_PROGRESS` | the original is still running | **409 Conflict** |
+
+That third case is the in-flight window — a retry arriving milliseconds after the original, before it has finished. You cannot return a payment that does not exist yet, and you must not create a second one. **409** is the honest answer: *this conflicts with the current state; try again shortly.* Not 400, because the request is perfectly well-formed. Not 500, because nothing broke.
+
+In practice the implementation reserves *first* and only investigates on failure, so the happy path is a single Redis round trip.
+
+### The release, which is easy to forget
+
+If payment creation throws, the reservation must be deleted. Otherwise the merchant is locked out of that idempotency key for 24 hours and can never retry a request that legitimately failed — a transient error turned permanent.
+
+```java
+try {
+    Payment saved = paymentService.create(...);
+    idempotencyService.storeResult(merchantId, key, saved.getId());
+    return saved;
+} catch (RuntimeException e) {
+    idempotencyService.release(merchantId, key);
+    throw e;
+}
+```
+
+### Key design
+
+Redis has one flat namespace. The universal convention is colons for hierarchy:
+
+```
+idem:ed82ce2a-e41a-4952-8dfd-d73abf2c9cd7:order-001
+└─┬─┘└──────────────┬─────────────────┘└────┬────┘
+prefix          merchant ID          client's key
+```
+
+**Scoping by merchant is not decoration.** Idempotency keys are chosen by clients. Two merchants could independently pick `order-1`, and without the merchant in the key, merchant B's payment would be silently blocked by merchant A's — a bug that would be almost impossible to reproduce.
+
+The `idem:` prefix means `KEYS idem:*` shows every idempotency key while debugging without wading through everything else.
+
+### Why the orchestration lives in the controller
+
+After nine days the instinct is *"business logic belongs in the service."* Here it doesn't, for two reasons.
+
+The honest one: idempotency is an HTTP-protocol concern. It's driven by a header and decides HTTP status codes. In production it would be a filter or interceptor — definitively the HTTP layer. Stripe treats it that way.
+
+The one that would have caused a real bug: **Spring implements `@Transactional` with a proxy.** External callers hit the proxy, which opens a transaction, calls the real method and commits. But a call from one method to another *inside the same bean* goes straight to the real object and **bypasses the proxy entirely**.
+
+So a `PaymentService.createIdempotent()` calling its own `create()` would run with no transaction at all. The payment would commit, and if a ledger write then failed there would be no rollback — a payment with no accounting, which is exactly what Day 5 existed to prevent. No error, no warning.
+
+**Self-invocation defeats Spring's proxy-based annotations.** Worth carrying: it applies to `@Transactional`, `@Cacheable`, `@Async` and anything else built the same way.
+
+### The durability trade-off
+
+Redis is not durable by default. If it restarts and loses a key, a retry in that window sails through and creates a duplicate charge.
+
+Some payment systems therefore store idempotency keys in the **database**, with a unique index, written inside the same transaction as the payment. That survives a crash and eliminates the window entirely, at the cost of extra latency on every request and a cleanup job for expired rows.
+
+Redis is the industry-standard choice and the right one here. But it is a choice, and being able to say why you would choose otherwise is worth more than the implementation.
+
+### A window that remains
+
+Between the payment committing and `storeResult` running there is a gap of roughly a millisecond. Crash exactly there and the key stays `IN_PROGRESS` until its TTL expires, so retries get 409 rather than the payment. That is the honest failure mode of this design, and it is the same gap the database-backed approach closes.
+
+### What the key does and does not check
+
+Reuse a key with a *different body* and the original payment comes back — the new amount is ignored entirely. The key asserts *"this is the same operation"* and the server takes it at its word without inspecting the request.
+
+Stripe goes further: it stores a fingerprint of the request and returns **422** if a key is reused with different content, on the grounds that you probably have a bug. Stricter and safer.
+
+Either is defensible. It should be a decision rather than an accident.
+
+---
+
+## Rate limiting
+
+### The problem
+
+A public endpoint with no ceiling is an endpoint anyone can hammer. A buggy merchant integration stuck in a retry loop, a scraper, or an actual attacker all produce the same outcome: the database saturates and **every other merchant's requests start failing**. One caller degrades the service for everyone.
+
+### Fixed-window counting
+
+Count requests per merchant per minute; refuse past a threshold. The key encodes the window:
+
+```
+rate:ed82ce2a-e41a-4952-8dfd-d73abf2c9cd7:29771924
+└─┬─┘└──────────── merchant ───────────┘└── minute ──┘
+```
+
+That last number is `System.currentTimeMillis() / 60000` — integer division giving a value that increments once a minute.
+
+When the clock ticks over, **the key name changes**, so a fresh counter springs into existence and the old one expires by itself. There is no reset logic anywhere in the code. The key name does the work.
+
+### `INCR`, and why the TTL is conditional
+
+```java
+Long count = redis.opsForValue().increment(key);
+if (count != null && count == 1L) {
+    redis.expire(key, WINDOW);
+}
+return count != null && count <= maxRequestsPerMinute;
+```
+
+`INCR` on a missing key treats it as 0, adds 1, and returns 1 — so there is no "create the counter" step. The first request creates it by incrementing it. And it is atomic, for the same reason `SET NX` is: read-then-write-back would let two simultaneous requests both see 19 and both write 20.
+
+**The TTL is set only when the count is 1.** That is the first request in this window. Setting it on every request would keep pushing the expiry forward and the key would never die.
+
+### This filter rejects, and that's new
+
+`ApiKeyFilter` and `JwtAuthFilter` never refuse anything — they record identity and let `SecurityConfig` decide. `RateLimitFilter` enforces directly, because rate limiting is not a per-path rule; it applies to everyone equally.
+
+```java
+if (auth != null && !rateLimitService.isAllowed(auth.getName())) {
+    response.setStatus(429);
+    response.setContentType("application/json");
+    response.getWriter().write("{\"error\":\"Rate limit exceeded. Try again shortly.\"}");
+    return;                       // no filterChain.doFilter — request stops dead
+}
+```
+
+**It writes the JSON by hand, and it has to.** `GlobalExceptionHandler` is a `@RestControllerAdvice` — it catches exceptions coming out of controllers, routed through the DispatcherServlet. A filter runs *before* the DispatcherServlet, so an exception thrown there never reaches that handler and produces a raw servlet error page instead.
+
+**429 Too Many Requests** is the correct code. Not 403 — the caller is perfectly permitted. They are simply going too fast.
+
+### `addFilterAfter`, and why order is load-bearing
+
+```java
+.addFilterBefore(apiKeyFilter, UsernamePasswordAuthenticationFilter.class)
+.addFilterBefore(jwtAuthFilter, ApiKeyFilter.class)
+.addFilterAfter(rateLimitFilter, ApiKeyFilter.class);
+```
+
+Rate limiting is per-merchant, so it needs `getAuthentication()` to already be populated. Place it before the auth filters and the SecurityContext is empty on every request, `auth` is null, the check is skipped, and **nothing is ever limited** — silently, with no error.
+
+Final order: **JwtAuthFilter → ApiKeyFilter → RateLimitFilter → the rest of Spring's chain.**
+
+### Known limitations
+
+**Unauthenticated traffic isn't limited at all.** The filter guards on `auth != null`, so someone brute-forcing `/auth/login` with bad passwords hits no ceiling. Production gateways add a second limiter keyed by IP address for exactly this.
+
+**Fixed windows allow a boundary burst.** Twenty requests at 10:00:59 and twenty more at 10:01:00 is forty in two seconds, despite a limit of twenty per minute. Sliding-window algorithms fix this using Redis sorted sets, at meaningfully more complexity. Fixed window is what most systems ship; knowing *why* it is imperfect is the part worth having.
+
+**No `Retry-After` header.** A well-behaved API tells the client how long to wait. Currently it just says no.
+
+### The pattern underneath both
+
+Idempotency asks *"have I seen this key?"* Rate limiting asks *"how many times this minute?"* Different questions, identical ingredients: an **atomic Redis operation**, a **carefully designed key name**, and a **TTL doing the cleanup**.
+
+That combination recurs everywhere — caching, distributed locks, session storage, deduplication, leaderboards. Learning it once here is worth considerably more than the two features it produced.
