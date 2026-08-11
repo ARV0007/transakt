@@ -26,24 +26,25 @@ The bank is simulated; no real money moves.
   - Service = chef · Repository = stock-keeper · PostgreSQL = the fridge
   - Spring IoC container = the manager who hires staff before opening
   - ApiKeyFilter = the ID-card reader at the staff entrance
-  - JWT = the wristband the front desk issues after you show ID — expires at closing,
-    access level printed on it, readable by the bouncer without phoning the desk
-  - **Redis = the notepad by the till** — instantly checkable, rebuildable if lost
+  - JWT = the wristband the front desk issues after you show ID
+  - Redis = the notepad by the till — instantly checkable, rebuildable if lost
 
 ---
 
 ## My environment
 
 - MacBook Air (Apple Silicon), macOS
-- Java 21 (Temurin) — project SDK must be **temurin-21**, never 26
+- Java 21 (Temurin) — project SDK must be **temurin-21**, never 26.
+  `JAVA_HOME` is pinned in `~/.zshrc` because Maven otherwise picks up Java 26 and Lombok breaks.
 - IntelliJ IDEA
-- PostgreSQL 18 via Postgres.app, port 5432, database `transakt`, user `aman`, no password
-- **`psql` is not on the PATH** — Postgres.app's binaries live at
-  `/Applications/Postgres.app/Contents/Versions/latest/bin/`
+- PostgreSQL 18 via Postgres.app, port 5432, databases `transakt` and `transakt_test`
+- **`psql` is not on the PATH** — binaries at `/Applications/Postgres.app/Contents/Versions/latest/bin/`
 - **Redis 8.10 via Homebrew.** `brew services start redis` **fails** on this machine — run
   `redis-server` in a dedicated Terminal tab instead, and leave it open while working.
 - Postman for API testing
 - Project path: `~/Documents/Coding/transakt`
+
+**To run the tests:** Redis and Postgres up, then `./mvnw test`. Expect 19 tests, ~20 seconds.
 
 ---
 
@@ -62,7 +63,7 @@ The bank is simulated; no real money moves.
 
 ---
 
-## Current state: Day 10 complete
+## Current state: Day 11 complete
 
 | Day | What was built |
 |-----|----------------|
@@ -75,12 +76,14 @@ The bank is simulated; no real money moves.
 | 7 | API key authentication via a custom Spring Security filter |
 | 8 | BCrypt passwords, JWT login, second auth filter, role-based access control |
 | 9 | Ownership authorization — identity from the token, 404 on foreign resources |
-| 10 | **Redis: idempotency keys and per-merchant rate limiting** |
+| 10 | Redis: idempotency keys and per-merchant rate limiting |
+| 11 | **Integration test suite — 19 tests covering auth, ownership, idempotency, rate limiting** |
 
 Architecture doc is at **v1.0**. All work committed and pushed.
 
-**Test accounts:** `test@shop.com` / `hunter2` = ADMIN · `regular@shop.com` / `hunter2` = MERCHANT.
-The three `priya@` merchants predate the password column and have `NULL` passwords — they cannot log in.
+**Test accounts (dev database):** `test@shop.com` / `hunter2` = ADMIN ·
+`regular@shop.com` / `hunter2` = MERCHANT. The three `priya@` merchants predate the password
+column and cannot log in. The test suite creates and rolls back its own merchants.
 
 ---
 
@@ -101,48 +104,47 @@ com.transakt.transakt
 ├── ledger/     LedgerEntry, EntryDirection (enum), LedgerEntryRepository
 ├── HealthController
 └── TransaktApplication
+
+src/test/java/com/transakt/transakt
+├── TransaktApplicationTests      smoke test — the context loads
+├── AuthIntegrationTest           6 tests
+├── OwnershipIntegrationTest      5 tests
+├── IdempotencyIntegrationTest    5 tests
+└── RateLimitIntegrationTest      2 tests
+
+src/test/resources/application-test.yaml    the `test` profile
 ```
 
 ---
 
 ## Key design decisions (and why)
 
-- **Double-entry ledger** — every payment appends two balancing rows (CREDIT to merchant,
-  DEBIT from gateway, equal amounts). Balances are never stored; they're the sum of entries.
-  Append-only, so the trail is tamper-evident.
+- **Double-entry ledger** — every payment appends two balancing rows. Balances are the sum of
+  entries, never stored. Append-only, so the trail is tamper-evident.
 - **Money as integer paise** (`Long`), never decimals. ₹500 = 50000.
-- **`@Transactional` on payment creation** — the payment row and both ledger entries commit
+- **`@Transactional` on payment creation** — payment row and both ledger entries commit
   together or not at all.
-- **Server-controlled fields** — id, status, createdAt, role **and merchantId** are set by the
-  server, never by the client. A client cannot choose its own identity any more than its own id.
-- **Layered architecture** — controller (HTTP only) → service (business rules) → repository.
-  Controllers read `Authentication` and pass plain values down, so services stay free of
-  Spring Security types and testable without a security context.
-- **API keys prefixed `tk_`** — like Stripe's `sk_`, Razorpay's `rzp_`.
-- **Two authentication doors on purpose** — API keys for machines (permanent, one DB lookup
-  per request), JWT for humans (1 hour, carries a role, verified locally with no DB hit).
-  Trade-off: a JWT can't be revoked before it expires, hence the short TTL.
-- **BCrypt for passwords**, cost 10 — deliberately slow, auto-salted, `WRITE_ONLY` on the field.
-- **Login returns the same error for both failure modes** — "Invalid email or password"
-  whether the email is unknown or the password wrong. Distinct messages leak which accounts
-  exist (email enumeration).
-- **Three layers of authorization** — authentication (who), roles (what kind of user),
-  ownership (is this yours). Roles do nothing for the third question.
-- **Foreign resources return 404, not 403** — a 403 confirms the ID is real and lets an
-  attacker enumerate. Both throws use an identical message, which is what makes it work.
-  Stripe and GitHub do the same.
-- **Fetch-then-check for one, scope-the-query for many** — `getById` loads and compares owners;
-  `getAllForCaller` picks a different query so unauthorised rows never load at all.
-- **The ownership rule lives in one method** — `getLedgerForPayment` calls `getById` and
-  discards the result, rather than duplicating the condition.
+- **Server-controlled fields** — id, status, createdAt, role and **merchantId** are set by the
+  server. A client cannot choose its own identity any more than its own id.
+- **Layered architecture** — controller (HTTP only) → service (rules) → repository (data).
+  Controllers read `Authentication` and pass plain values down.
+- **Two authentication doors** — API keys for machines (permanent, one DB lookup per request),
+  JWT for humans (1 hour, carries a role, no DB hit). Trade-off: JWTs can't be revoked early.
+- **Three layers of authorization** — authentication, roles, ownership. Roles do nothing for
+  the third question.
+- **Foreign resources return 404, not 403** — a 403 confirms the ID is real. Both cases use an
+  identical message, which is what makes it work.
+- **Fetch-then-check for one, scope-the-query for many.**
 - **Two state stores** — Postgres for the truth, Redis for facts that expire. TTL means no
   cleanup job exists anywhere in the codebase.
 - **Idempotency keys on `POST /payments`** — atomic `SET NX EX`, scoped per merchant, 24h TTL.
-  A retry returns the original payment; an in-flight duplicate gets 409.
 - **Idempotency orchestration is in the controller** — because self-invocation would bypass
   Spring's `@Transactional` proxy.
 - **Rate limiting via `INCR`** on a key containing the current minute, so the window resets by
   itself when the key name changes.
+- **Tests are integration tests, deliberately** — the interesting behaviour lives in the wiring
+  (filter chain, path rules, ownership, Redis), and a mocked unit test would pass while the
+  security config was wide open.
 
 ---
 
@@ -165,55 +167,55 @@ All authenticated endpoints are rate limited to 20 requests per merchant per min
 
 ## Gotchas already hit (don't repeat these)
 
-- Lombok needs **annotation processing enabled** in IntelliJ or its generated methods appear missing
+- Lombok needs **annotation processing enabled** in IntelliJ
+- **Lombok also breaks on a too-new JDK** — `TypeTag :: UNKNOWN` at compile time means Maven is
+  using a different JDK from IntelliJ. Check `./mvnw -version` against the project SDK.
 - YAML forbids **duplicate keys** at one level — a second `spring:` silently drops the first
 - **A correctly-spelled YAML key in the wrong place is silently ignored** — a misplaced
   `data: redis:` fell back to defaults that happened to match, so nothing appeared wrong
-- `.gitignore` only blocks **untracked** files; use `git rm -r --cached` for already-tracked ones
-- Repositories seemingly missing `save()`/`findById()` = **stale IntelliJ index** —
-  Maven Reload + Rebuild, or Invalidate Caches
+- `.gitignore` only blocks **untracked** files; use `git rm -r --cached`
+- Repositories seemingly missing `save()`/`findById()` = **stale IntelliJ index**
 - Artifact **names** change between major Spring versions, not just numbers
 - 401 = "who are you"; 403 = "not permitted"; 409 = "conflicts with current state";
   429 = "too fast"
-- **Tables are plural** — `merchants`, `payments`, `ledger_entries`. `\dt` lists them.
-- **`ddl-auto: update` cannot add a NOT NULL column** to a table with existing rows. Fix:
-  `ADD COLUMN IF NOT EXISTS` (nullable) in psql, backfill with `UPDATE`, then restart.
-  This is what Flyway exists for.
-- **jjwt 0.12 was a breaking release** — `setSubject`/`setExpiration`/`setSigningKey`/
-  `parseClaimsJws` became `subject`/`expiration`/`verifyWith`/`parseSignedClaims`.
-- **`hasRole("ADMIN")` looks for an authority literally named `ROLE_ADMIN`** — Spring prepends
-  the prefix when checking, so you must write it when creating.
-- **In `authorizeHttpRequests`, first match wins.** But `@GetMapping` resolves by **pattern
-  specificity**, not declaration order. Two config systems, two rules — don't confuse them.
+- **Tables are plural** — `merchants`, `payments`, `ledger_entries`
+- **`ddl-auto: update` cannot add a NOT NULL column** to a populated table
+- **jjwt 0.12 was a breaking release** — `verifyWith`/`parseSignedClaims` replaced the old API
+- **`hasRole("ADMIN")` looks for an authority literally named `ROLE_ADMIN`**
+- **`authorizeHttpRequests` is first-match-wins**, but `@GetMapping` resolves by pattern
+  specificity — two config systems, two rules
 - **Self-invocation defeats Spring's proxies** — a `@Transactional` method called from another
-  method on the same bean runs with no transaction, silently.
+  method on the same bean runs with no transaction, silently
 - **Filters run before the DispatcherServlet**, so `@RestControllerAdvice` cannot catch what
-  they throw — write the response by hand.
-- **Two IntelliJ import traps:** `lombok.Value` above Spring's `@Value`, and `java.sql.Date`
-  above `java.util.Date`. Also **"Add static import" ≠ "Import class"**.
-- **A method declared inside another method's body** cascades into a huge error count.
-  A big error count usually means *one* structural problem — fix the earliest and the rest go.
-- **Don't keep two overloads that make different guarantees.**
+  they throw — write the response by hand
+- **`src/main` and `src/test` are separate compilation units.** A test class under `src/main`
+  fails with `cannot find symbol: class Test`, because `spring-boot-starter-test` is
+  test-scoped. Right-click the package under **`src/test/java`**, not the identical one under
+  `src/main/java`.
+- **`@Transactional` rolls back Postgres, not Redis.** Test isolation is per-store — anything
+  outside the transaction manager needs an explicit `flushDb()` in `@BeforeEach`.
+- **Two IntelliJ import traps:** `lombok.Value` above Spring's `@Value`, `java.sql.Date` above
+  `java.util.Date`. Also **"Add static import" ≠ "Import class"**, and it will offer
+  `RequestEntity.post` instead of `MockMvcRequestBuilders.post` — "Ambiguous method call" means
+  both are imported.
+- **A big error count usually means *one* structural problem** — fix the earliest one
 - **IntelliJ shows fake errors in `notes.md`** — it injects a Java parser into ```java code
   fences and the fragments don't compile. Markdown doesn't compile; ignore them.
-- **A sudden 403 on a request that worked minutes ago = check the token age first.**
-  Hit this twice; both times the token had passed its one-hour expiry.
-- **Store the JWT in a shell variable** (`TOKEN='...'` on its own line, single quotes) rather
-  than editing long curl lines — two test runs failed from mangling the token inline.
-- **`cp` to a different filename case does nothing on macOS** — the filesystem is
-  case-insensitive. Use `git mv` for case-only renames.
-- **macOS numbers repeat downloads** — `~/Downloads/notes.md` may be weeks old while the new
-  one is `notes_4.md`. Always run `ls -lt ~/Downloads/*.md | head -5` and check today's
-  timestamp before copying, or you'll silently overwrite new work with old.
-- Watch for **dictation landing in an open file** instead of the chat box. Happened twice.
+- **A sudden 403 on a request that worked minutes ago = check the token age first**
+- **Store the JWT in a shell variable** (`TOKEN='...'`) rather than editing long curl lines
+- **`git add` before `mv` stages the old paths** — re-run `git add -A src/` and git records
+  clean renames instead of showing the same file three times
+- **`cp` to a different filename case does nothing on macOS** — use `git mv`
+- **macOS numbers repeat downloads** — `~/Downloads/notes.md` may be weeks old. Always run
+  `ls -lt ~/Downloads/*.md | head -5` and check today's timestamp before copying.
+- Watch for **dictation landing in an open file** instead of the chat box
 
 ---
 
 ## What's next
 
-- **Day 11 — automated tests.** The biggest gap in the project. Every Postman scenario from
-  Days 8–10 should be a JUnit test.
-- Then: Flyway migrations, pagination, hashed API keys
+- **Day 12 — Flyway migrations, pagination, hashed API keys.** The three things standing
+  between this and a deployable state.
 - Then: Docker + docker-compose (whole stack in one command)
 - Then: first real deployment — Railway or Render, managed Postgres and Redis, HTTPS
 - Then: Kafka (payment events, webhook delivery with retries + DLQ), bank simulator,
@@ -221,20 +223,15 @@ All authenticated endpoints are rate limited to 20 requests per merchant per min
 
 Also outstanding:
 
-- **Unauthenticated traffic isn't rate limited** — the filter guards on an existing identity,
-  so brute-forcing `/auth/login` hits no ceiling. Production adds an IP-keyed limiter.
-- **Fixed-window rate limiting allows a boundary burst** — twenty either side of a minute
-  boundary is forty in two seconds.
-- **Idempotency keys aren't fingerprinted against the request body** — reusing a key with a
-  different amount returns the original payment. Stripe returns 422 instead.
-- **No pagination** on `GET /api/v1/payments`. Fix is `Page<Payment>` + `Pageable`.
-- **API keys are still plain text.** Hashing isn't symmetric with passwords: verifying a key
-  means *finding* the row, and a hash can't be indexed. Fix is a lookup prefix —
-  `tk_live_<lookup>_<secret>`, index the lookup half, hash only the secret half.
-- `POST /api/v1/merchants` returns 200; REST convention is 201 + `Location` header.
-- Password changes have no endpoint. `MerchantService.update()` deliberately ignores the field.
-- No merchant-scoped ledger listing — entries are reachable only via their parent payment.
-- No `Retry-After` header on 429s.
+- Unauthenticated traffic isn't rate limited; no IP-based limiter
+- Fixed-window rate limiting allows a boundary burst
+- Idempotency keys aren't fingerprinted against the request body (Stripe returns 422)
+- No pagination on `GET /api/v1/payments`
+- API keys still plain text
+- Schema changes are manual under `ddl-auto: update`
+- `POST /api/v1/merchants` returns 200, not 201; no password-change endpoint;
+  no `Retry-After` header on 429s
+- No CI — the suite runs locally but nothing runs it on push
 
 ---
 

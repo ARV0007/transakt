@@ -741,3 +741,191 @@ Final order: **JwtAuthFilter → ApiKeyFilter → RateLimitFilter → the rest o
 Idempotency asks *"have I seen this key?"* Rate limiting asks *"how many times this minute?"* Different questions, identical ingredients: an **atomic Redis operation**, a **carefully designed key name**, and a **TTL doing the cleanup**.
 
 That combination recurs everywhere — caching, distributed locks, session storage, deduplication, leaderboards. Learning it once here is worth considerably more than the two features it produced.
+
+---
+
+## Day 11 — Testing
+
+### The problem
+
+Every scenario in this project had been verified by hand in Postman. Login works. Ownership checks work. Idempotency works. All confirmed, all real.
+
+None of it stays confirmed.
+
+Refactor `SecurityConfig` next week, accidentally make `/api/v1/payments` public, and nothing says a word. You find out when a stranger reads someone's transaction history. The verification happened once, in a moment, and then decayed.
+
+**A test is a claim made once that a machine re-checks forever.** That is the entire product. Finding bugs today is a side effect.
+
+It is also the fastest signal an interviewer reads. Ten days of careful architecture with zero tests reads as someone who has not yet worked on a team.
+
+### Why integration tests, not unit tests
+
+The usual advice is a pyramid: many fast unit tests at the bottom, fewer integration tests above, a few end-to-end tests at the top. Sensible advice, and mostly wrong for this project.
+
+Think about where the interesting behaviour actually lives here. A filter chain. Per-path rules evaluated first-match-wins. Ownership checks that depend on who authenticated. Idempotency that depends on Redis. Rate limiting that depends on a filter running *after* the auth filters.
+
+A unit test of `PaymentService` with mocked repositories would pass happily while `SecurityConfig` was wide open — it never touches a filter. It would test the arithmetic and miss the entire security model.
+
+So the tests go through the front door: real HTTP requests, the real filter chain, a real database. Precisely the Postman scenarios, made permanent.
+
+### MockMvc
+
+`MockMvc` sends requests through the full Spring stack **without opening a network port**. Filters run, the DispatcherServlet routes, controllers execute, services hit Postgres and Redis. Only the TCP layer is skipped.
+
+Nineteen tests run in about twenty seconds. Each one by hand in Postman was a minute of clicking and pasting tokens.
+
+```java
+mockMvc.perform(get("/api/v1/payments/" + paymentId)
+                .header("Authorization", "Bearer " + token))
+        .andExpect(status().isNotFound());
+```
+
+That reads as the scenario it is.
+
+### The four annotations
+
+`@SpringBootTest` starts the **entire application** — every bean, every filter, both connections. If any bean cannot be constructed or any config is malformed, the test fails before a single line of test code runs.
+
+`@AutoConfigureMockMvc` builds the `MockMvc` bean so it can be injected.
+
+`@ActiveProfiles("test")` layers `application-test.yaml` on top of the main config. **This one line is the difference between a test suite and a data-loss incident** — without it, `ddl-auto: create-drop` would delete every merchant and payment in the real database.
+
+`@Transactional` on a test class wraps each test in a transaction that is **rolled back afterwards**. A merchant created in one test does not exist in the next. Every test starts from the same state.
+
+### The test profile
+
+A Spring profile is a named set of config layered on top of `application.yaml`, not a replacement for it. Only the handful of things that differ get overridden.
+
+```yaml
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/transakt_test
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+  data:
+    redis:
+      database: 1
+
+ratelimit:
+  requests-per-minute: 10000
+```
+
+**A separate database**, so a test cannot touch development data.
+
+**`create-drop`** builds the schema from the entities at startup and drops it at the end. Every run begins from an empty, correctly-shaped database — no leftover rows, no "works on my machine because I happen to have that merchant". It doubles as a free schema check: broken entity mappings fail the run immediately.
+
+**Redis database 1.** Redis ships with sixteen numbered databases sharing one server but with completely separate keyspaces. The application uses 0, tests use 1. Same process, no collision, no second install.
+
+**A rate limit of 10,000**, because a test suite fires dozens of requests per second and would trip the real limit of 20 instantly — failing tests for entirely the wrong reason.
+
+### Test isolation is per-store, not automatic
+
+This is the part worth carrying to every future project.
+
+`@Transactional` rolls back **Postgres**. It does nothing to **Redis**.
+
+So an idempotency key written by one test is still sitting there when the next runs. A rate-limit counter survives. The database resets; the cache does not.
+
+```java
+@BeforeEach
+void clearRedis() {
+    redis.getConnectionFactory().getConnection().serverCommands().flushDb();
+}
+```
+
+Anything outside the transaction manager — a cache, a message queue, a file on disk, an external API — needs cleaning up explicitly. The rollback is not a general-purpose reset button; it is a database feature that happens to be very convenient.
+
+### Two actors in one test
+
+Ownership is a claim about two people, so testing it requires being both.
+
+```java
+String alice = tokenFor(ALICE);
+String paymentId = createPayment(alice, 50000);
+
+String bob = tokenFor(BOB);
+
+mockMvc.perform(get("/api/v1/payments/" + paymentId)
+                .header("Authorization", "Bearer " + bob))
+        .andExpect(status().isNotFound());
+```
+
+By hand that is two signups, two logins, copying two tokens, creating a payment, copying its ID, and swapping headers. Here it is six lines, and it runs in milliseconds every time the suite runs.
+
+The mechanism that makes it possible:
+
+```java
+.andReturn().getResponse().getContentAsString()
+```
+
+`jsonPath` **checks** a value. `andReturn` **retrieves** one. You need the retrieved token and payment ID to build the *next* request — assertions alone cannot chain.
+
+### `@TestPropertySource` and the context cache
+
+Rate limiting needs a low limit to test, but the rest of the suite needs a high one. One annotation solves it:
+
+```java
+@TestPropertySource(properties = "ratelimit.requests-per-minute=5")
+```
+
+The cost is worth knowing. Spring **caches application contexts** and reuses them across test classes with identical configuration — which is why the second, third and fourth test classes start almost instantly. A property override makes the configuration different, so that class gets its own context and pays the startup cost again.
+
+Fine for one class. Scatter overrides across twenty and the suite crawls.
+
+### Naming tests as sentences
+
+`paymentsAreClosedWithoutACredential`, not `testPayments1`.
+
+When a test fails, the name is the first thing read, often in a CI log with no other context. It should say what broke, not what was called.
+
+The four test classes read as a specification of the system:
+
+- signup is open and never returns the password
+- login with a wrong password is rejected
+- login with an unknown email gives the identical message
+- a merchant cannot read another merchant's payment
+- the list endpoint is scoped to the caller
+- `merchantId` in the body is ignored
+- the same key twice returns the same payment
+- two merchants can use the same key independently
+- one merchant hitting the limit does not affect another
+
+That list is more useful documentation than most README files.
+
+### Testing a known limitation on purpose
+
+```java
+@Test
+void aReusedKeyIgnoresADifferentBody() {
+    String first = createPayment(token, "order-001", 50000);
+    String second = createPayment(token, "order-001", 999999);
+    assertThat(second).isEqualTo(first);
+}
+```
+
+This asserts a **deliberate simplification**, not ideal behaviour. Stripe would return 422 here; this system returns the original payment and ignores the new amount.
+
+Writing a test for a limitation is worth doing. If body fingerprinting is added later, this test fails — which forces the change to be noticed rather than sliding in unannounced. A test that encodes a decision is as valuable as one that encodes a requirement.
+
+### The tests that matter most
+
+The ones guarding failures that would be **silent** in production:
+
+| Change | Consequence | Test that catches it |
+|---|---|---|
+| Delete `@JsonProperty(WRITE_ONLY)` | every password hash exposed on a public endpoint | signup never returns the password |
+| Change one login error message | email enumeration | both failure paths, identical message |
+| Add `merchantId` back to the DTO | payments filed under other accounts | `merchantId` in the body is ignored |
+| Drop merchant from the idempotency key | two merchants collide on `order-1` | two merchants, same key, independently |
+| Drop merchant from the rate key | the whole user base throttled as one bucket | one merchant's limit does not affect another |
+
+Every one of those is a one-word change that looks harmless in a diff, and nearly impossible to catch by hand.
+
+### `src/main` and `src/test` are separate worlds
+
+A test class created under `src/main/java` fails with `cannot find symbol: class Test` — baffling, because the import is correct.
+
+The reason: `spring-boot-starter-test` is declared with `<scope>test</scope>`, so it is on the classpath for `src/test` and **not** for `src/main`. They are separate compilation units with separate dependency sets. JUnit genuinely does not exist when compiling main.
+
+Same for `application-test.yaml`. Placed under `src/main/resources` it still works — main resources are on the test classpath too — but it would also be packaged into the production JAR, shipping a config file pointing at `transakt_test` with a rate limit of 10,000. Not a bug today; a nasty one at the first deployment.
