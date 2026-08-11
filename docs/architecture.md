@@ -1,6 +1,6 @@
 # Transakt Architecture
 
-## Current: v1.0 — Idempotency and rate limiting (Day 10)
+## Current: v1.1 — Integration test suite (Day 11)
 
 ```mermaid
 flowchart TD
@@ -40,6 +40,12 @@ flowchart TD
 
 **How a request flows:** Tomcat parses the HTTP request. Three filters run before any controller. `JwtAuthFilter` looks for an `Authorization: Bearer` header and, if the signature verifies and the token has not expired, records the caller's merchant ID and role in the SecurityContext with no database access. `ApiKeyFilter` then looks for `X-API-Key` and, if the context is still empty, resolves the key to a merchant row and does the same. `RateLimitFilter` runs last of the three — deliberately, because it needs an identity to count against — and refuses the request outright with 429 if that merchant has exceeded its per-minute allowance. The DispatcherServlet then routes to a controller. Controllers read the caller's identity from the SecurityContext and hand services plain values, so services stay free of Spring Security types. `PaymentService` is `@Transactional` on writes: a payment plus its two balancing ledger entries commit together or not at all.
 
+**The test suite (v1.1):** nineteen integration tests across four classes, running against the full stack in about twenty seconds. `AuthIntegrationTest` covers signup, login and both failure paths. `OwnershipIntegrationTest` covers foreign payments and ledgers returning 404, list scoping, and the forged `merchantId` being ignored. `IdempotencyIntegrationTest` covers key reuse, key scoping per merchant, and the deliberate decision not to fingerprint the request body. `RateLimitIntegrationTest` covers the 429 threshold and the fact that one merchant hitting the ceiling does not affect another. All use `MockMvc`, which sends real requests through the entire filter chain and into a real database without opening a network port.
+
+**Why integration rather than unit tests (v1.1):** almost everything interesting in this system lives in the wiring — a three-filter chain, first-match-wins path rules, ownership checks that depend on who authenticated, idempotency and rate limiting that depend on Redis. A unit test of `PaymentService` with mocked repositories would pass happily while `SecurityConfig` was wide open, because it never touches a filter. Testing through the front door is what makes the security model verifiable at all. The tests worth having are the ones guarding failures that would be **silent** in production: removing `@JsonProperty(WRITE_ONLY)` from the password field, changing one login error message and reopening email enumeration, adding `merchantId` back to the request DTO, or dropping the merchant ID out of an idempotency or rate-limit key. Each is a one-word change that looks harmless in a diff.
+
+**Test isolation is per-store (v1.1):** the `test` profile points at a separate `transakt_test` database with `ddl-auto: create-drop`, so every run begins from an empty, correctly-shaped schema built from the entities — which doubles as a free check that the mappings are valid. `@Transactional` on each test class rolls back after every test, so tests cannot see each other's data. Crucially, that rollback covers **Postgres only**: Redis keys survive between tests, so the idempotency and rate-limit classes flush Redis explicitly in `@BeforeEach`. Tests use Redis database 1 while the application uses 0 — sixteen numbered databases share one server with entirely separate keyspaces, so no second install is needed. The rate-limit class raises its own low limit through `@TestPropertySource`, which forces Spring to build a separate application context for that class alone.
+
 **Two state stores, on purpose (v1.0):** PostgreSQL holds the truth — merchants, payments, ledger entries, all durable and queryable. Redis holds facts that matter intensely for a short time and then never again: idempotency keys for 24 hours, rate-limit counters for 60 seconds. Redis's TTL means both expire themselves, with no scheduled cleanup job anywhere in the codebase. The trade-off accepted knowingly is durability — Redis is in-memory and a restart loses its contents, which for a rate-limit counter is harmless and for an idempotency key opens a brief window in which a retry could double-charge. Systems that cannot tolerate that store idempotency keys in the database with a unique index and pay the latency.
 
 **Idempotency (v1.0):** `POST /api/v1/payments` accepts an optional `Idempotency-Key` header. The controller reserves the key with an atomic `SET NX EX` under `idem:<merchantId>:<clientKey>`, creates the payment, then overwrites the reservation with the payment ID. A retry carrying the same key gets the **original payment** back — same id, same createdAt — rather than creating a second one. A duplicate arriving while the original is still in flight finds `IN_PROGRESS` and receives **409 Conflict**. A failed creation releases the reservation, so a transient error does not lock the merchant out of that key for a day. The atomicity is the point: checking whether a key exists and then setting it is two operations, and two simultaneous retries can both pass the check. Keys are scoped by merchant because clients choose their own key strings and two merchants could independently pick the same one.
@@ -60,13 +66,13 @@ flowchart TD
 
 **Known limitations:**
 
+- **No CI.** The suite runs when someone remembers to run it. Nothing runs it on push.
 - **Unauthenticated traffic is not rate limited.** The filter guards on an existing identity, so brute-forcing `/auth/login` hits no ceiling. Production gateways add an IP-keyed limiter.
 - **Fixed-window rate limiting allows a boundary burst** — twenty requests either side of a minute boundary is forty in two seconds. Sliding windows via sorted sets fix it at more complexity.
-- **Idempotency keys are not fingerprinted against the request body.** Reusing a key with a different amount returns the original payment silently; Stripe returns 422 instead.
-- **No automated tests.** Everything is verified by hand.
+- **Idempotency keys are not fingerprinted against the request body.** Reusing a key with a different amount returns the original payment silently; Stripe returns 422 instead. This limitation is itself covered by a test, so changing it cannot happen unnoticed.
 - **No pagination.** `GET /api/v1/payments` returns every matching row. Spring Data supports it via `Page<Payment>` and a `Pageable` parameter.
 - **API keys are stored in plain text.** Hashing them is not symmetric with hashing passwords: verifying a key means *finding* the row it belongs to, and a hash cannot be indexed. The fix is a lookup prefix — `tk_live_<lookup>_<secret>` — indexing the lookup half and hashing only the secret half.
-- **Schema changes are manual** under `ddl-auto: update`. Production would use Flyway.
+- **Schema changes are manual** under `ddl-auto: update`, which cannot add a `NOT NULL` column to a populated table and leaves no record of the fix. Production would use Flyway.
 - **No merchant-scoped ledger listing.** Ledger entries are reachable only through their parent payment.
 - `POST /api/v1/merchants` returns 200; REST convention is 201 with a `Location` header. There is no password-change endpoint and no `Retry-After` on 429s.
 
@@ -82,4 +88,5 @@ flowchart TD
 | v0.7 | 7 | API key authentication via a Spring Security filter. |
 | v0.8 | 8 | BCrypt passwords, JWT login, a second auth filter, and role-based access control. |
 | v0.9 | 9 | Ownership authorization: identity taken from the token, 404 on foreign resources, scoped collection queries. |
-| **v1.0** | **10** | **Redis. Idempotency keys prevent double charges; per-merchant rate limiting.** |
+| v1.0 | 10 | Redis. Idempotency keys prevent double charges; per-merchant rate limiting. |
+| **v1.1** | **11** | **Integration test suite — nineteen tests across auth, ownership, idempotency and rate limiting.** |
