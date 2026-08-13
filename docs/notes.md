@@ -929,3 +929,82 @@ A test class created under `src/main/java` fails with `cannot find symbol: class
 The reason: `spring-boot-starter-test` is declared with `<scope>test</scope>`, so it is on the classpath for `src/test` and **not** for `src/main`. They are separate compilation units with separate dependency sets. JUnit genuinely does not exist when compiling main.
 
 Same for `application-test.yaml`. Placed under `src/main/resources` it still works — main resources are on the test classpath too — but it would also be packaged into the production JAR, shipping a config file pointing at `transakt_test` with a rate limit of 10,000. Not a bug today; a nasty one at the first deployment.
+
+## Database migrations with Flyway
+
+### The problem it solves
+
+`ddl-auto: update` looks at your entities, looks at the database, and quietly builds whatever is
+missing. Convenient — and unusable past a certain point:
+
+- It refuses anything risky. Adding a NOT NULL column to a populated table just fails.
+- It leaves no record. Nothing in the repo says how the schema reached its current shape.
+- It can't be reviewed, and it can't be replayed on another machine.
+
+Every hand-run `ALTER TABLE` in psql is a change that exists on exactly one laptop.
+
+### How Flyway works
+
+Numbered SQL files in `src/main/resources/db/migration`, named `V<n>__<description>.sql` — capital V,
+**double** underscore. On startup Flyway compares them against a table it keeps in the database,
+`flyway_schema_history`, and runs whatever hasn't run yet, in order.
+
+Two consequences worth internalising:
+
+- **Flyway runs inside the app, at startup.** A failed boot means no migration at all. There's no
+  partial state to clean up.
+- **Applied migrations are frozen.** Flyway stores a checksum of each file. Edit one after it's run
+  and every later startup dies with a checksum mismatch. The schema is wrong? Write V3. Never touch V1.
+
+### Baselining an existing database
+
+A brand-new database starts at page one and runs everything. A database that already has tables
+can't — V1 says "create these tables" and they exist.
+
+`baseline-on-migrate: true` handles that: on a **non-empty** schema with no history table, Flyway
+writes a baseline row at `baseline-version` and skips every migration at or below it.
+
+The behaviour is conditional on emptiness, which means one config produces two outcomes:
+
+| | dev `transakt` (had tables) | test `transakt_test` (empty) |
+|---|---|---|
+| baseline fires? | yes | no |
+| V1 | skipped, logged as `BASELINE` | runs, logged as `SQL` |
+| V2 | runs | runs |
+
+**The test database is the only place V1 ever actually executes.** That makes `./mvnw test` the proof
+that the migration is correct — and it's why the test DB has to be dropped and recreated first.
+A leftover non-empty test schema would baseline, skip V1, and hand back a green suite that verified
+nothing.
+
+Hence `baseline-on-migrate: false` in the test profile. A test database has exactly one legitimate
+starting state, so anything else should stop the build. General principle: a setting that makes an
+unexpected state *recoverable* belongs in dev and does not belong in tests.
+
+### `validate` mode
+
+With Flyway owning construction, Hibernate switches to `ddl-auto: validate` — it compares entities
+against the schema and refuses to start on a mismatch, but never builds anything. Two independent
+things now have to agree before the app will run, which is the point.
+
+### Indexes
+
+Without an index, filtering by a column means reading every row (a sequential scan). The initial
+dump contained no `CREATE INDEX` at all, so `findByMerchantId` and the ledger lookup were both
+scanning full tables.
+
+Not every column needs one. **A UNIQUE constraint already creates an index** — Postgres implements
+uniqueness *using* one. `merchants.api_key` and `merchants.email` were already covered; adding
+indexes there would have cost disk and write speed for nothing. Only plain non-unique columns you
+filter on need a hand-written `CREATE INDEX`.
+
+Indexes aren't free either: every INSERT now updates them too. The trade is worth it when reads
+dominate writes, which is true for a payment list.
+
+### Noted while reading the dump
+
+`pg_dump` emitted no FOREIGN KEY constraints, and that's correct rather than a truncated file:
+`Payment` holds `merchantId` and `LedgerEntry` holds `paymentId` as plain scalar columns, not
+`@ManyToOne` associations. Hibernate only generates FKs for mapped object relationships. So the
+database will not stop a payment from referencing a merchant that doesn't exist — the service layer
+is the only thing enforcing that.

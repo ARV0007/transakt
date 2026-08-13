@@ -77,3 +77,53 @@
 **Interview line:** "I wrote the suite as integration tests rather than unit tests, deliberately. Almost everything interesting in this project lives in the wiring — a filter chain, per-path rules, ownership checks that depend on who authenticated, idempotency that depends on Redis. A mocked unit test of the service layer would pass while the security config was wide open. So the tests send real HTTP requests through the whole stack against a real database. The ones I care about most are the ones that would fail silently in production: delete the `WRITE_ONLY` annotation on the password field and a test goes red; change one login failure message and the email-enumeration protection breaks a test; drop the merchant ID out of an idempotency or rate-limit key and two merchants start colliding. Those are single-word changes that look harmless in a diff and are nearly impossible to catch by hand."
 **Mistake & fix:** `./mvnw test` failed with `Fatal error compiling: java.lang.ExceptionInInitializerError: com.sun.tools.javac.code.TypeTag :: UNKNOWN`, which is Lombok hooking into a compiler it does not understand. IntelliJ had been compiling fine because it uses the project SDK, temurin-21; Maven was using the shell's `JAVA_HOME`, which pointed at Java 26 — the exact thing my own context file warns about. Fixed permanently by appending `export JAVA_HOME=$(/usr/libexec/java_home -v 21)` to `~/.zshrc`. Separately, three files landed in the wrong place: `application-test.yaml` and `AuthIntegrationTest` were created under `src/main` instead of `src/test`, and `IdempotencyIntegrationTest` went directly under `src/test/java` instead of inside the package folder. The first produced a baffling `cannot find symbol: class Test`, because `spring-boot-starter-test` is test-scoped and simply is not on the main classpath — `src/main` and `src/test` are separate compilation units. IntelliJ also auto-imported `org.springframework.http.RequestEntity.post` alongside `MockMvcRequestBuilders.post`, producing "Ambiguous method call", which is a friendlier error than it looks: Java found two valid candidates and refused to guess. And `git add src/` was run before the files were moved, so git showed the same files three times — staged at the old path, deleted, and untracked at the new one; `git add -A src/` resolved it into clean renames.
 
+## Day 12a — Flyway migrations (13 Aug 2026)
+
+**Built**
+- Added `flyway-core` + `flyway-database-postgresql` (the second is mandatory from Flyway 10 onward — Postgres support moved out of core).
+- `V1__initial_schema.sql` — a `pg_dump --schema-only --no-owner` of the live `transakt` schema, preamble trimmed.
+- `V2__add_query_indexes.sql` — `idx_payments_merchant_id`, `idx_ledger_entries_payment_id`.
+- `application.yaml`: `ddl-auto: update` → `validate`; added `spring.flyway` with `baseline-on-migrate: true`, `baseline-version: 1`.
+- `application-test.yaml`: `ddl-auto: create-drop` → `validate`; added `baseline-on-migrate: false` as a deliberate guard.
+- Dropped and recreated `transakt_test` so the migrations ran against a genuinely empty schema.
+
+**Why**
+Day 8 hit the wall that makes this necessary: `ddl-auto: update` cannot add a NOT NULL column to a
+table that already has rows. The fix was a hand-run `ALTER TABLE` in psql — a change that existed
+only on my laptop, recorded nowhere, reproducible by nobody. Flyway makes every schema change a
+numbered, ordered, checksummed file in the repo. The database's shape becomes something the code
+review can see.
+
+**Concepts**
+- **Migration history table.** Flyway keeps `flyway_schema_history` in the database itself. That's the
+  record of which versions have been applied, so the database knows its own state rather than
+  relying on anyone remembering.
+- **`validate` vs `update`.** Hibernate stops building anything and only checks that the schema
+  matches the entities. If it doesn't, the app refuses to start. All construction is Flyway's job now.
+- **Baselining.** `baseline-on-migrate: true` handles a database that already exists: Flyway writes a
+  baseline row at `baseline-version` and skips everything at or below it. The dev DB skipped V1 for
+  exactly this reason; the freshly-created test DB ran it for real. Same config, opposite path.
+- **Indexes.** Both new indexes back non-unique columns used for filtering. Columns with a UNIQUE
+  constraint (`merchants.api_key`, `merchants.email`) already have an index — Postgres implements
+  unique constraints *as* unique indexes — so adding one by hand there would be pure waste.
+
+**Interview line**
+"I moved schema management off Hibernate's `ddl-auto` and onto Flyway, and baselined the existing
+database rather than dropping it. The subtle part is that the same config behaves differently on a
+pre-existing database than on an empty one, so I disabled baselining in the test profile — a
+non-empty test database should fail the build loudly instead of silently skipping the first
+migration and reporting a green suite that proved nothing."
+
+**Mistakes & fixes**
+1. `pg_dump` on PostgreSQL 18 wraps its output in `\restrict` / `\unrestrict`. The opening one went
+   with the trimmed preamble; the closing one sat *below* "dump complete" and looked like a footer.
+   Flyway isn't psql — it sends statements over JDBC, so a backslash line is a syntax error, and
+   since migrations run in a transaction the whole schema would have rolled back. Removed with
+   `sed -i '' '/^\\unrestrict/d'` (macOS `sed` requires the empty `''`).
+2. V2 was never actually saved to disk. `ls` showed one file, `total 8`. Flyway wouldn't have
+   errored — it would have run V1, reported success, and left the indexes uncreated. Verifying with
+   `ls` before running is now part of the routine.
+3. `./mvnw spring-boot:run` failed with "Port 8080 was already in use" — a stale instance from
+   IntelliJ's run button, started *before* the config change. Same cause explained a second symptom:
+   the dev database looked untouched because the process holding the port predated Flyway.
+   `lsof -i :8080` → `kill <PID>`.
