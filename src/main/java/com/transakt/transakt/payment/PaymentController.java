@@ -6,7 +6,10 @@ import com.transakt.transakt.ledger.LedgerEntry;
 import jakarta.validation.Valid;
 import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.*;
-
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.domain.Sort;
+import org.springframework.data.web.PageableDefault;
 import java.util.List;
 
 @RestController
@@ -61,8 +64,10 @@ public class PaymentController {
     }
 
     @GetMapping
-    public List<Payment> getAll(Authentication authentication) {
-        return paymentService.getAllForCaller(authentication.getName(), isAdmin(authentication));
+    public Page<Payment> getAll(
+            Authentication authentication,
+            @PageableDefault(size = 20, sort = "createdAt", direction = Sort.Direction.DESC) Pageable pageable) {
+        return paymentService.getAllForCaller(authentication.getName(), isAdmin(authentication), pageable);
     }
 
     @GetMapping("/{id}")
