@@ -7,7 +7,7 @@ spring:
     password: ""
   jpa:
     hibernate:
-      ddl-auto: update
+      ddl-auto: validate
     show-sql: true
     open-in-view: false
     properties:
@@ -17,6 +17,10 @@ spring:
     redis:
       host: ${REDIS_HOST:localhost}
       port: ${REDIS_PORT:6379}
+  flyway:
+    enabled: true
+    baseline-on-migrate: true
+    baseline-version: 1
 
 jwt:
   secret: ${JWT_SECRET:transakt-dev-secret-key-change-me-min-32-chars}

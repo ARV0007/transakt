@@ -3,11 +3,13 @@ spring:
     url: jdbc:postgresql://localhost:5432/transakt_test
   jpa:
     hibernate:
-      ddl-auto: create-drop
+      ddl-auto: validate
     show-sql: false
   data:
     redis:
       database: 1
+  flyway:
+    baseline-on-migrate: false
 
 ratelimit:
   requests-per-minute: 10000
