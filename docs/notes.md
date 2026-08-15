@@ -1008,3 +1008,176 @@ dominate writes, which is true for a payment list.
 `@ManyToOne` associations. Hibernate only generates FKs for mapped object relationships. So the
 database will not stop a payment from referencing a merchant that doesn't exist — the service layer
 is the only thing enforcing that.
+
+## Pagination
+
+### The problem
+
+An endpoint that returns "all the rows this caller owns" is fine until it isn't. At seven payments
+nothing shows. At 100,000 it fails three ways simultaneously: Postgres builds the entire result set,
+Hibernate materialises every row as a Java object in heap, and Jackson serialises the lot into one
+response. A single request can take the app down.
+
+The subtler problem is that the client has no way to ask for less. There's no vocabulary in the API
+for "just the newest twenty."
+
+### The three pieces
+
+**`Pageable`** — an object meaning "page 0, 20 rows, sorted by createdAt descending." You never build
+one by hand in a controller; Spring MVC resolves it from query parameters, the same mechanism that
+resolves `Authentication` from the SecurityContext.
+
+**`Page<T>`** — the rows *plus* metadata: total elements, total pages, whether this is the last one.
+That metadata is what lets a UI render "showing 21–40 of 312."
+
+**Repository support** — any derived query accepts a `Pageable` and returns a `Page`. Spring Data
+rewrites the SQL. Confirmed in the logs:
+
+```
+where p1_0.merchant_id=? order by p1_0.created_at desc fetch first ? rows only
+```
+
+The `ORDER BY` comes from `@PageableDefault`, the `LIMIT` from the `Pageable`, and that `WHERE` is
+exactly what `idx_payments_merchant_id` was built for.
+
+### Why it's usually two queries
+
+`Page` promises `getTotalElements()`, and a slice of 20 rows cannot know the total. So Spring Data
+fires a second query: `SELECT count(*) FROM payments WHERE merchant_id = ?`.
+
+It's smarter than always doing it — on the first page, if fewer rows come back than the page size, the
+total is already known and the count is skipped. If you never need totals, `Slice<T>` does one query,
+fetching size+1 rows and inferring "there's more" from whether the extra row exists.
+
+### Offset pagination has a ceiling
+
+`OFFSET 100000` makes Postgres walk and discard a hundred thousand rows before returning anything.
+Offset degrades with depth, which is why Stripe uses cursors (`starting_after=<id>`) instead. At small
+scale offset is the right call — but knowing *why* the large APIs don't use it is the half that matters
+in an interview.
+
+### Cap the page size
+
+Spring's default is 20 per page with **no upper bound**. Without `max-page-size`, `?size=999999` is a
+supported request and you're back to the original problem, except now it looks like a feature. Stripe
+allows 1–100; GitHub allows 1–100. One config line is the difference between pagination as a protection
+and pagination as a suggestion.
+
+### Don't publish a framework's internals
+
+Returning `Page` directly serialises `PageImpl` — its `size`, `number` and `sort` appear at the top
+level *and* again inside a `pageable` blob, alongside `unpaged`, `paged` and `offset`. Spring logs a
+warning about this, and the warning is the real point: that shape is an implementation detail, so a
+library refactor would change your public JSON.
+
+`@EnableSpringDataWebSupport(pageSerializationMode = VIA_DTO)` produces a deliberate shape instead:
+
+```json
+{ "content": [ ... ], "page": { "size": 20, "number": 0, "totalElements": 7, "totalPages": 1 } }
+```
+
+Same information, none of the internals, and a contract that won't move underneath you.
+
+---
+
+## Hashing a credential that has no username
+
+### Why the obvious approach fails
+
+Passwords are hashed with BCrypt. The natural instinct is to do the same to API keys. It doesn't work,
+and the reason is worth understanding properly.
+
+BCrypt is **salted** — hash the same input twice and you get two different strings. That's fine for
+passwords because you know *who* is logging in: the email finds exactly one row, and `matches()`
+compares the attempt against that row's stored hash.
+
+An API key has no email. **The key is the identity.** To find the merchant you would have to
+BCrypt-compare the incoming key against every row in the table — one deliberately-slow hash per
+merchant, per request. At a thousand merchants that's a dead API.
+
+### The lookup prefix
+
+The fix is to make the key structured, so part of it is safe to store in the clear:
+
+```
+tk_8e4a5219dc634cceb30fa146289d95ef
+└prefix┘└──────── secret ─────────┘
+```
+
+Two columns replace one:
+
+- **`api_key_prefix`** — stored plainly, indexed, unique. Not a secret. It identifies *which* merchant
+  without proving anything.
+- **`api_key_hash`** — SHA-256 of the whole key. This is what actually authenticates.
+
+Authentication becomes one indexed lookup on the prefix, then one hash comparison against that single
+row. Constant time regardless of table size. This is exactly why Stripe's `sk_live_...` and GitHub's
+`ghp_...` keys look the way they do.
+
+Failing at either step returns the same answer — no distinction between "no such prefix" and "wrong
+secret," for the same reason ownership failures return 404 rather than 403.
+
+### SHA-256, not BCrypt
+
+Slow hashing exists because humans choose guessable passwords; the cost per attempt is what makes a
+leaked hash impractical to brute-force. A 256-bit random key isn't guessable at any hash speed. BCrypt
+here would add tens of milliseconds to every single API request to defend against an attack that cannot
+happen.
+
+Two details in the implementation:
+
+- **Lowercase hex.** `HexFormat.of().formatHex()` matches what Postgres's `encode(..., 'hex')` wrote
+  during the backfill. Uppercase would compare unequal against every migrated row.
+- **`MessageDigest.isEqual`, not `String.equals`.** `equals` returns at the first differing byte, so
+  response time technically leaks how many leading characters were correct. Barely exploitable over a
+  network, universally done anyway.
+
+### Expand and contract
+
+Changing a live schema in one step means a moment where the code and the database disagree. The
+alternative is four steps:
+
+1. **Expand** — add the new columns, nullable, and backfill them.
+2. **Dual-write** — start populating them on every write.
+3. **Switch readers** — point the code at the new columns.
+4. **Contract** — enforce NOT NULL, drop the old column.
+
+Between 1 and 4 the database supports both shapes, so nothing is ever in a state where a rollback loses
+data. The only irreversible step is last and isolated.
+
+Two orderings matter and both are easy to get backwards:
+
+**Writers before readers.** Switch the reader first and any row created in between has a plaintext key
+but no hash — a merchant who cannot authenticate at all.
+
+**NOT NULL belongs to contract, not expand.** They're the same two statements either way. In the expand
+phase the entity doesn't map the columns yet, so Hibernate's INSERT omits them, Postgres writes NULL,
+and every signup fails.
+
+### Showing a secret exactly once
+
+After the plaintext column is dropped, the key exists nowhere — which means the merchant has to be
+shown it at creation or never.
+
+`@Transient` on the field does this: Hibernate ignores it entirely, but it remains a normal Java field,
+so the service can set it and Jackson still serialises it. Fetch that merchant tomorrow and `apiKey`
+comes back null — not a bug, just the truth.
+
+**One trap.** `SimpleJpaRepository.save()` calls `em.persist()` for new entities and `em.merge()`
+otherwise, and "new" means the ID is null. If your service assigns the ID itself, `save()` merges —
+which copies only *persistent* state onto a fresh managed instance and returns **that**. `@Transient`
+fields don't survive the crossing. So this:
+
+```java
+return merchantRepository.save(merchant);   // apiKey is null on the way out
+```
+
+has to become:
+
+```java
+Merchant saved = merchantRepository.save(merchant);
+saved.setApiKey(apiKey);
+return saved;
+```
+
+Invisible while `apiKey` was a mapped column. Making it `@Transient` is what exposed it.

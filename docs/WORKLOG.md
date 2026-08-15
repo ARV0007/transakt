@@ -127,3 +127,124 @@ migration and reporting a green suite that proved nothing."
    IntelliJ's run button, started *before* the config change. Same cause explained a second symptom:
    the dev database looked untouched because the process holding the port predated Flyway.
    `lsof -i :8080` → `kill <PID>`.
+
+
+## Day 12b — pagination on GET /payments (13–14 Aug 2026)
+
+**Built**
+- `findByMerchantId` returns `Page<Payment>` and takes a `Pageable`; deleted the old `List` overload.
+- `getAllForCaller` gained a `Pageable` param. The admin branch needed nothing — `findAll(Pageable)`
+  comes free from `JpaRepository`.
+- Controller: `@PageableDefault(size = 20, sort = "createdAt", direction = DESC)`.
+- `spring.data.web.pageable.max-page-size: 100`.
+- New `WebConfig`: `@EnableSpringDataWebSupport(pageSerializationMode = VIA_DTO)`.
+
+**Why**
+`GET /payments` returned every row a merchant owned. Invisible at seven payments; at 100,000 it fails
+three ways at once — Postgres builds the entire result set, Hibernate materialises every row as a Java
+object, Jackson serialises the lot into one response. And the client had no way to ask for less: there
+was no vocabulary in the API for "just the newest twenty."
+
+**Concepts**
+- **`Pageable` / `Page`.** Spring MVC resolves a `Pageable` straight from query parameters, the same way
+  it resolves `Authentication` from the SecurityContext. Spring Data rewrites the SQL to add
+  `LIMIT`/`OFFSET`. Verified in the logs:
+  `where merchant_id=? order by created_at desc fetch first ? rows only` — and that `WHERE` is exactly
+  the query `idx_payments_merchant_id` was built for on 12a.
+- **The second query.** `Page` promises `getTotalElements()`, which a slice of 20 rows can't know, so
+  Spring Data fires a `COUNT`. It skips it when the first page returns fewer rows than the page size,
+  because then the total is already in hand.
+- **Offset pagination has a ceiling.** `OFFSET 100000` makes Postgres walk and discard 100,000 rows
+  before returning anything. That's why Stripe uses cursors (`starting_after=<id>`) rather than offsets.
+- **A cap is not optional.** Spring's default page size is 20 with *no upper bound*, so `?size=999999`
+  is a supported request and puts you back where you started — except now it looks like a feature.
+- **Don't publish a framework's internals.** Returning `Page` directly serialises `PageImpl`, which
+  duplicates `size`/`number`/`sort` at the top level and again inside a `pageable` blob. Spring warns
+  about this because the shape isn't guaranteed stable. `VIA_DTO` gives
+  `{content: [...], page: {size, number, totalElements, totalPages}}` and a contract that won't move.
+
+**Interview line**
+"I paginated the list endpoint with Spring Data's `Pageable`, capped the page size server-side, and
+switched the response to `PagedModel` rather than serialising `PageImpl` — publishing a framework
+class as your API contract means a library refactor changes your public JSON."
+
+**Mistake & fix**
+`curl -s ... | python3 -m json.tool` returned `Expecting value: line 1 column 1` — an *empty* body, not
+malformed JSON. `-s` silences curl's errors and the pipe swallows the status line. The app simply
+wasn't running. When a response is empty, drop the pretty-printer and use `curl -i`.
+
+---
+
+## Day 12c — hashed API keys (14–15 Aug 2026)
+
+**Built**
+- `V3__hash_api_keys.sql` (expand): added `api_key_prefix` + `api_key_hash` nullable, backfilled from
+  the plaintext column, unique index on the prefix.
+- `common/ApiKeyHasher.java`: `PREFIX_LENGTH`, `prefixOf` with a length guard, `hash` via
+  `MessageDigest` + `HexFormat`, `matches` via `MessageDigest.isEqual`.
+- `Merchant` maps both columns; `@JsonIgnore` on the hash.
+- `MerchantService.create` populates all three from one generated key.
+- `ApiKeyFilter`: `prefixOf` → `findByApiKeyPrefix` → `matches`.
+- `V4__drop_plaintext_api_key.sql` (contract): `SET NOT NULL` ×2, then `DROP COLUMN api_key`.
+- `Merchant.apiKey` became `@Transient` so the key is still shown once at creation.
+
+**Why**
+`merchants.api_key` was stored in plaintext. Any dump, leak, or read-only login exposed every live
+credential. Passwords were solved with BCrypt on Day 5 — the obvious move was to do the same here.
+
+**It doesn't work, and the reason is the interesting part.** BCrypt is salted, so the same key hashes
+differently every time. That's fine for passwords because the email identifies the row first, and
+`matches()` compares against that one hash. An API key has no email — the key *is* the identity. To
+find the merchant you'd BCrypt-compare against every row in the table, one deliberately-slow hash per
+merchant, per request.
+
+Hence the two-column design: a **prefix** that's indexed and not secret, used only to find the row,
+and a **hash** that authenticates it. One indexed lookup plus one comparison, constant time regardless
+of how many merchants exist. Same shape as Stripe's `sk_live_...` and GitHub's `ghp_...`.
+
+**Concepts**
+- **SHA-256, not BCrypt.** Slow hashing exists because humans pick guessable passwords. A 256-bit
+  random key isn't brute-forceable at any hash speed, so BCrypt would add latency to every API request
+  to defend against an attack that can't happen.
+- **Expand/contract.** Add the new columns → start *writing* them → switch *readers* → drop the old
+  column. Between the first and last step the database supports both shapes, so nothing is ever in a
+  state where a rollback loses data, and the only irreversible step is last and isolated.
+- **Writers before readers.** Switching the reader first would leave any merchant created in between
+  with a plaintext key and no hash — unable to authenticate at all.
+- **NOT NULL belongs to contract, not expand.** Same two statements, opposite phase. In expand the
+  entity doesn't map the columns yet, so Hibernate's INSERT omits them and every signup would fail.
+- **Constant-time comparison.** `String.equals` returns at the first differing byte, which in principle
+  leaks how much of a guess was right. `MessageDigest.isEqual` doesn't.
+- **The shown-once pattern.** `@Transient` means Hibernate ignores the field entirely but Jackson still
+  serialises it. The key appears in the response that created it and nowhere else, ever.
+
+**Interview line**
+"I migrated plaintext API keys to hashed storage using expand/contract across four steps, so the system
+kept working throughout and only the final step was irreversible. The design detail worth explaining is
+why you can't just BCrypt an API key: with no separate identifier, authentication would mean hashing
+against every row. Splitting the key into an indexed public prefix and a secret hash makes the lookup
+constant-time — it's why Stripe and GitHub keys look the way they do."
+
+**Mistakes & fixes**
+1. **My own plan had the step order backwards** — readers before writers. Caught before writing code.
+2. **The draft V3 included `SET NOT NULL`.** Would have failed every signup test. Those moved to V4.
+3. **A missing `package` line produced ~100 errors in unrelated files.** `ApiKeyHasher.java` had no
+   package declaration (a Cmd+A paste wiped it), so javac reported `duplicate class`. Because Lombok is
+   an *annotation processor*, that early failure aborted processing and every Lombok-generated getter
+   in the project vanished at once. The fix was one line. **Always read the first errors, never the
+   tail:** `./mvnw compile 2>&1 | grep "ERROR.*\.java:" | head -20`.
+4. **The three-keys trap.** `create()` generated the key inline inside `setApiKey(...)`. Adding the
+   prefix and hash lines without extracting to a local variable first would have called
+   `UUID.randomUUID()` three separate times — storing a prefix and hash for keys nobody ever received.
+   Every column would have looked correctly populated. Only comparing `shasum -a 256` of the issued key
+   against the stored hash would have revealed it.
+5. **`save()` drops `@Transient` fields.** Signup started returning `apiKey: null` after V4. Because the
+   service assigns the ID itself, Spring Data's `isNew()` is false, so `save()` calls `em.merge()` —
+   which copies only *persistent* state onto a new managed instance and returns that. Fixed by
+   re-setting the field on the returned object.
+
+**Worth recording separately:** #5 was caught by `signupIsOpenAndNeverReturnsThePassword`, a test
+written on Day 11 to check something entirely different — that signup doesn't leak the password hash.
+It caught a subtle JPA behaviour four days later in code that had nothing to do with passwords. That's
+the actual return on a test suite: not the bugs it finds the day you write it, but the ones it finds on
+a Saturday in code you weren't thinking about.
