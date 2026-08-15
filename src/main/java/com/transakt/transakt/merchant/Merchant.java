@@ -1,5 +1,6 @@
 package com.transakt.transakt.merchant;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import jakarta.persistence.*;
 import lombok.AllArgsConstructor;
@@ -28,7 +29,15 @@ public class Merchant {
     private String businessName;
 
     @Column(name = "api_key", unique = true)
+    @Transient
     private String apiKey;
+
+    @Column(name = "api_key_prefix", length = 16)
+    private String apiKeyPrefix;
+
+    @JsonIgnore
+    @Column(name = "api_key_hash", length = 64)
+    private String apiKeyHash;
 
     @JsonProperty(access = JsonProperty.Access.WRITE_ONLY)
     private String password;

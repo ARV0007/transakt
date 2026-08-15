@@ -35,15 +35,21 @@ public class ApiKeyFilter extends OncePerRequestFilter {
         if (apiKey != null
                 && SecurityContextHolder.getContext().getAuthentication() == null) {
 
-            Optional<Merchant> merchant = merchantRepository.findByApiKey(apiKey);
-            if (merchant.isPresent()) {
-                var authentication = new UsernamePasswordAuthenticationToken(
-                        merchant.get().getId(),
-                        null,
-                        List.of(new SimpleGrantedAuthority(
-                                "ROLE_" + merchant.get().getRole().name()))
-                );
-                SecurityContextHolder.getContext().setAuthentication(authentication);
+            String prefix = ApiKeyHasher.prefixOf(apiKey);
+
+            if (prefix != null) {
+                Optional<Merchant> merchant = merchantRepository.findByApiKeyPrefix(prefix);
+
+                if (merchant.isPresent()
+                        && ApiKeyHasher.matches(apiKey, merchant.get().getApiKeyHash())) {
+                    var authentication = new UsernamePasswordAuthenticationToken(
+                            merchant.get().getId(),
+                            null,
+                            List.of(new SimpleGrantedAuthority(
+                                    "ROLE_" + merchant.get().getRole().name()))
+                    );
+                    SecurityContextHolder.getContext().setAuthentication(authentication);
+                }
             }
         }
 

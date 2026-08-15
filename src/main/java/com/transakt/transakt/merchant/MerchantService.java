@@ -1,7 +1,8 @@
 package com.transakt.transakt.merchant;
 
+import com.transakt.transakt.common.ApiKeyHasher;
 import com.transakt.transakt.common.ResourceNotFoundException;
-import org.springframework.security.crypto.password.PasswordEncoder;   // ← NEW (1)
+import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 
 import java.time.Instant;
@@ -12,24 +13,35 @@ import java.util.UUID;
 public class MerchantService {
 
     private final MerchantRepository merchantRepository;
-    private final PasswordEncoder passwordEncoder;                     // ← NEW (2)
+    private final PasswordEncoder passwordEncoder;
 
     public MerchantService(MerchantRepository merchantRepository,
-                           PasswordEncoder passwordEncoder) {          // ← NEW (3)
+                           PasswordEncoder passwordEncoder) {
         this.merchantRepository = merchantRepository;
-        this.passwordEncoder = passwordEncoder;                        // ← NEW (3)
+        this.passwordEncoder = passwordEncoder;
     }
 
     public Merchant create(Merchant merchant) {
         merchant.setId(UUID.randomUUID().toString());
-        merchant.setApiKey("tk_" + UUID.randomUUID().toString().replace("-", ""));
+
+        String apiKey = "tk_" + UUID.randomUUID().toString().replace("-", "");
+        merchant.setApiKey(apiKey);
+        merchant.setApiKeyPrefix(ApiKeyHasher.prefixOf(apiKey));
+        merchant.setApiKeyHash(ApiKeyHasher.hash(apiKey));
+
         merchant.setCreatedAt(Instant.now());
 
-        if (merchant.getPassword() != null) {                          // ← NEW (4)
+        if (merchant.getPassword() != null) {
             merchant.setPassword(passwordEncoder.encode(merchant.getPassword()));
         }
 
-        return merchantRepository.save(merchant);
+        // The ID is already assigned, so Spring Data's isNew() is false and save()
+        // calls merge(), which returns a NEW managed instance carrying only the
+        // persistent state. apiKey is @Transient, so it doesn't survive that copy —
+        // this is the merchant's only chance to ever see it.
+        Merchant saved = merchantRepository.save(merchant);
+        saved.setApiKey(apiKey);
+        return saved;
     }
 
     public Merchant getById(String id) {
