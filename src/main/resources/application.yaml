@@ -2,9 +2,9 @@ spring:
   application:
     name: transakt
   datasource:
-    url: jdbc:postgresql://localhost:5432/transakt
-    username: aman
-    password: ""
+    url: jdbc:postgresql://${DB_HOST:localhost}:5432/${DB_NAME:transakt}
+    username: ${DB_USER:aman}
+    password: ${DB_PASSWORD:}
   jpa:
     hibernate:
       ddl-auto: validate
