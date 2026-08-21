@@ -13,11 +13,5 @@ public class TransaktApplication {
 		SpringApplication.run(TransaktApplication.class, args);
 	}
 
-	@Bean
-	CommandLineRunner redisCheck(StringRedisTemplate redis) {
-		return args -> {
-			redis.opsForValue().set("startup-check", "ok");
-			System.out.println(">>> Redis says: " + redis.opsForValue().get("startup-check"));
-		};
-	}
+
 }
