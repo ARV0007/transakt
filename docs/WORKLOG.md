@@ -248,3 +248,412 @@ written on Day 11 to check something entirely different — that signup doesn't 
 It caught a subtle JPA behaviour four days later in code that had nothing to do with passwords. That's
 the actual return on a test suite: not the bugs it finds the day you write it, but the ones it finds on
 a Saturday in code you weren't thinking about.
+
+## Day 13 — Docker and docker-compose (15–17 Aug 2026)
+
+**Built**
+- **`Dockerfile`, multi-stage.** Stage one is `maven:3.9-eclipse-temurin-21` and compiles the jar;
+  stage two is `eclipse-temurin:21-jre` and runs it, pulling the artifact across with
+  `COPY --from=build /app/target/*.jar`. `-DskipTests`, because the tests need Postgres and Redis
+  and neither exists during an image build.
+- **Layer ordering that matters.** `COPY pom.xml` and `mvn dependency:go-offline` come *before*
+  `COPY src`, so the dependency layer caches. It took 154.9 seconds the first time and zero on
+  every rebuild since.
+- **`.dockerignore`** — `target/`, `.git/`, `.idea/`, `*.iml`, `.DS_Store`, `docs/`.
+- **`docker-compose.yml`** — three services: `postgres:18`, `redis:8-alpine`, `app`. Healthchecks
+  with `condition: service_healthy`. Named volume on Postgres only. Only `app` publishes 8080.
+- **`application.yaml`** — datasource parameterised: `${DB_HOST:localhost}`, `${DB_NAME:transakt}`,
+  `${DB_USER:aman}`, `${DB_PASSWORD:}`. Local behaviour unchanged; compose supplies its own values.
+
+**Verified 17 Aug 01:54** — `Successfully applied 4 migrations to schema "public", now at version v4`,
+`Started TransaktApplication in 4.43 seconds`, and `curl -i http://localhost:8080/api/v1/health`
+returning 200 from the Mac. V1–V4 ran as real SQL against a completely empty containerised Postgres
+18.6 — no baselining, no shortcuts.
+
+**Why**
+Running Transakt required three manual preconditions: Postgres.app started, `redis-server` alive in
+its own terminal tab, and `JAVA_HOME` pinned to temurin-21. Every one of those is a thing a new
+machine doesn't have and a thing I'd have to explain to anyone I handed the repo to. "Works on my
+machine" is not a property of the code; it's a property of the machine.
+
+There's a second reason, and it's the one that actually forced the work: Day 14 is impossible without
+this. A platform doesn't run your source, it runs an image.
+
+And it closed the loop on Day 12a. That empty containerised Postgres had never seen this project.
+The schema arrived correctly anyway, built from migrations, on infrastructure nobody had configured.
+That's the whole payoff from moving off `ddl-auto`, demonstrated rather than argued.
+
+**Concepts**
+- **Image vs container.** The image is the recipe, the container is the meal. One image, many
+  containers, none of them carrying state that matters.
+- **Multi-stage builds.** The build needs Maven, a full JDK, and ~200 MB of downloaded dependencies.
+  The runtime needs a JRE and one jar. Shipping the first to production means shipping a compiler and
+  a package manager to a machine that should only be running code.
+- **Layer caching, and why instruction order is a design decision.** Docker caches each instruction
+  and invalidates everything below the first change. `COPY src` before dependency resolution would
+  re-download every dependency on every one-character code edit. Splitting the copy in two is the
+  single highest-leverage line in a Dockerfile.
+- **Build context.** Docker ships the entire directory to the daemon *before* running any instruction.
+  Without `.dockerignore` that's the full git history and every compiled class, uploaded on each build
+  to be ignored.
+- **Service names are hostnames.** Inside the compose network, `postgres` resolves. `localhost` does
+  not mean "the host machine" — inside the app container it means the app container.
+- **`depends_on` is not enough.** It waits for the *container* to exist, not for Postgres to accept
+  connections. The app boots in three seconds and would lose that race routinely. Healthchecks with
+  `condition: service_healthy` are load-bearing, not decoration.
+- **Volumes are a statement about what's worth keeping.** Postgres gets a named volume. Redis
+  deliberately doesn't — everything in it has a TTL and is meant to expire.
+- **Publishing ports is opt-in.** Only `app` exposes one. Postgres and Redis stay invisible to the
+  host, which also avoids colliding with Postgres.app on 5432.
+
+**Interview line**
+"I containerised the whole stack — app, Postgres and Redis — so it starts with one command. The two
+details worth explaining are ordering the Dockerfile so the dependency layer caches, which took the
+rebuild from two and a half minutes to nothing, and using healthchecks rather than `depends_on`,
+because `depends_on` only waits for the container to exist and my app boots faster than Postgres
+accepts connections."
+
+**Mistakes & fixes**
+1. **Docker CLI is not the Docker daemon.** `docker --version` and `docker compose version` are local
+   binaries that never contact the engine, so both pass happily while Docker Desktop isn't running.
+   `docker info` is the command that proves the daemon is up — it prints a full Client section, then
+   fails at `Server:`.
+2. **Postgres 18 changed its data directory layout.** The official image now uses major-version
+   subdirectories for `pg_ctlcluster` compatibility, so a volume mounted at
+   `/var/lib/postgresql/data` is reported as an "unused mount/volume" and the container exits 1.
+   Correct config for 18+ is a single mount at `/var/lib/postgresql`, then `docker compose down -v`
+   to clear the half-initialised volume. (docker-library/postgres PR 1259, issue 37.)
+3. **Compose interleaves every container's output.** Redis's startup banner buried Postgres's fatal
+   error completely. `docker compose logs <service>` isolates one.
+4. **IntelliJ creates files relative to the selected Project panel node.** `docker-compose.yml` first
+   landed inside `target/` — gitignored, wiped by `mvn clean`, and excluded by `.dockerignore`. Click
+   the root node first.
+5. **Port 8080 conflict, third occurrence.** `lsof -ti :8080 | xargs kill`.
+
+**Also noted:** Flyway logs a benign warning that PostgreSQL 18.4 is newer than it officially
+supports. It validated every migration anyway. That wants a Flyway bump eventually, not a Postgres
+downgrade.
+
+---
+
+## Day 14 — first deployment (17–23 Aug 2026)
+
+**Live at https://transakt.onrender.com**
+
+**Built**
+- **Platform choice: Render.** Railway has had no free tier since 2023 ($5/month minimum). Render
+  still has a genuine zero-cost path and asks for no card.
+- **Two remaining config gaps** (commit `90a8512`): `server.port: ${PORT:8080}` at the top level, a
+  sibling of `spring:`; and `spring.data.redis.password: ${REDIS_PASSWORD:}` alongside host and port.
+- **Three Render resources:** web service `transakt` (Docker, Free, Singapore, Auto-Deploy on),
+  `transakt-db` (PostgreSQL 18, Free, expires 17 Sept 2026), `transakt-redis` (**Valkey 8**, Free,
+  `allkeys-lru`).
+- **Environment variables:** `DB_HOST`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `JWT_SECRET`,
+  `REDIS_HOST`, `REDIS_PORT`. No `REDIS_PASSWORD` — internal authentication is off, so internal
+  traffic needs none.
+- **Commit `b6045be`** — deleted a `@Bean CommandLineRunner` that had been quietly killing every
+  deploy for three days. See below; it's the whole story of this day.
+
+**Verified in production, 22–23 Aug**
+`GET /health` 200 · signup 200 with a real UUID and hashed key · login 200 with a JWT ·
+`GET /payments` 200, paginated and scoped · `POST /payments` 201 CAPTURED · the same
+`Idempotency-Key` replayed returns the same payment · a 25-request loop returns nineteen 200s then
+six 429s. Nineteen rather than twenty because the payment created moments earlier had already spent
+one slot in that minute — which is itself the proof that the counter is per merchant per minute
+across *all* authenticated endpoints, not per endpoint.
+
+**Why**
+Everything before this was a claim. Fourteen days of architecture that only runs on one laptop is
+indistinguishable, from the outside, from fourteen days of nothing. A URL is evidence.
+
+And it's where Day 12a stops being a design preference and starts being the thing that makes
+deployment possible at all. A fresh managed Postgres, four migration files, and the schema builds
+itself. Without Flyway this day would have begun with hand-running SQL against a production database.
+
+**Concepts**
+- **One artifact, three environments.** Every external address is `${VAR:sensible-default}`. The same
+  image runs on the Mac, in compose, and in Singapore; only the environment differs. The defaults
+  aren't laziness — they're what keeps local development working with zero setup.
+- **Platform-injected PORT.** The host decides the port and tells the app. Binding a hardcoded 8080
+  is a contract the platform never agreed to.
+- **Internal versus external hostnames.** Render gives both. The internal `dpg-…` / `red-…` form
+  never leaves their network and needs no TLS; the external form is public and does. Private
+  networking is per-region, which is why all three services had to be in Singapore.
+- **Free-tier trade-offs, accepted knowingly.** The web service spins down after 15 minutes idle —
+  the first request afterwards measured *over two minutes*, not the 50 seconds advertised. Free
+  Postgres expires 30 days after creation. Neither matters much when the schema rebuilds from
+  migrations and the loss would be demo data.
+- **Valkey.** Render's Key Value is Valkey, the fork created after Redis changed its licence. It's
+  wire-compatible, so Lettuce and Spring Data Redis needed no changes at all.
+- **Reading a deploy log.** "Exited with status 1" is a wrapper, never a cause. Search for `ERROR`,
+  then `Caused by` — don't scroll. And read a Spring stack trace **bottom-up**: the last `Caused by:`
+  is the truth, everything above it is framework plumbing.
+- **`x-render-routing: no-deploy`** means the service has never had a successful deploy. The mystery
+  HTML page served for three days was Render's own 502, not the app.
+- **Defaults are not decisions.** Render's Postgres ships with inbound `0.0.0.0/0`; its Key Value
+  ships blocking all external traffic. Same platform, two opposite security postures, neither of them
+  chosen by me. Worth auditing rather than inheriting.
+
+**Interview line**
+"The deployment itself was routine. What's worth talking about is the three days it took to find the
+failure. Every deploy exited with status 1 and the platform's error message was a wrapper with no
+cause in it. It turned out to be a six-line `CommandLineRunner` I'd added as a debug check on Day 13,
+which pinged Redis at startup. A `CommandLineRunner` runs *after* the context refreshes and Tomcat
+binds — so the image had built, the database had connected, the migrations had applied and the server
+had started, every single time. Then a debug line threw and Spring closed the whole context. The
+failure was at the finish line, which is exactly why nothing upstream looked wrong."
+
+**Mistakes & fixes**
+1. **The three-day outage, and the assumption underneath it.** My notes said the app would boot fine
+   without Redis, reasoning that Lettuce connects lazily and `/health` never touches it. That was
+   wrong, and being wrong about it cost the whole week. Because I believed it, I treated the stuck
+   Redis instance and the failing deploy as *two independent problems* — and spent days debugging
+   ports, build contexts and database config on a failure that Redis was causing all along. The fix
+   was deleting six lines. **A wrong assumption doesn't slow you down; it points you somewhere else
+   entirely.**
+2. **Docker Build Context Directory is a folder, Dockerfile Path is a file.** Pointing the context at
+   `./Dockerfile` produced `invalid local: stat /opt/render/project/src/Dockerfile: not a directory`.
+   Correct values are `.` and `./Dockerfile` respectively.
+3. **Commit `de87094` was a one-line no-op — the intended edits never landed.** Render deploys from
+   GitHub, so an unpushed or unsaved change simply doesn't exist to it. The check that closes this
+   off is `git show origin/main:src/main/resources/application.yaml`, which reads the file *as
+   pushed* rather than the copy on disk.
+4. **The Key Value instance that would never provision.** Two instances hung on "Creating" — one for
+   six hours — and a third couldn't be created at all. That third failure was the clue: the free tier
+   allows one Key Value per workspace, and the stuck one was holding the slot. **Delete first, then
+   create.** The replacement was Available in under five minutes.
+5. **Both auth doors failing identically pointed downstream of both.** With the app finally running,
+   every authenticated endpoint returned an empty-bodied 403 — with a fresh JWT *and* with a fresh
+   API key. Two completely different credential paths failing the same way isn't a coincidence in
+   each; it's one fault after both. It was `RateLimitFilter` reaching for a Redis that didn't exist
+   yet. Testing both doors separately is what split the problem.
+6. **A signal that carries two meanings proves neither.** Those 403s came with a `JSESSIONID`, which
+   I first read as proof the request had arrived unauthenticated. It isn't: in Spring Security 6 the
+   context is persisted to a session when a filter *sets* an Authentication, so the cookie appears
+   either way. The log settled it in ten seconds; the inference had been leading the wrong direction
+   for twenty minutes.
+7. **A sudden 403 mid-test, again.** Same lesson as Day 9, learned again the hard way: the token had
+   passed its one-hour expiry. Check the token age before anything else.
+8. **An interactive prompt is not a shell.** Twice during SSH setup, the next command was pasted in
+   as the *answer* to a question — once to `ssh-keygen`'s "where to save the key", once to ssh's
+   "continue connecting?". Terminal looks identical either way. If the line ends in `?` or `:` rather
+   than `%`, answer it first. Passphrase prompts also echo nothing while you type, which reads as a
+   frozen window.
+9. **GitHub HTTPS credentials expire.** `Password authentication is not supported for Git
+   operations`. Switched the remote to SSH with an ed25519 key, which doesn't expire.
+
+**Still open**
+- The Redis failure surfaced as an empty-bodied **403 rather than a 500**. `RateLimitFilter` is
+  registered before `UsernamePasswordAuthenticationFilter`, so it runs upstream of
+  `ExceptionTranslationFilter` and an uncaught throw should have escaped as a 500. Something is
+  catching it. Worth finding — and the design question underneath is worth answering deliberately:
+  **when the rate limiter's store is unreachable, fail open or fail closed?** Failing closed turns a
+  Redis outage into a total outage. Failing open drops the ceiling exactly when the system is already
+  unhealthy. And the answer probably shouldn't be the same for idempotency, where failing open means
+  charging a customer twice.
+- **Still no CI.** Nineteen tests that run when someone remembers to run them. This is now the
+  largest gap in the project.
+## Day 13 — Docker and docker-compose (15–17 Aug 2026)
+
+**Built**
+- **`Dockerfile`, multi-stage.** Stage one is `maven:3.9-eclipse-temurin-21` and compiles the jar;
+  stage two is `eclipse-temurin:21-jre` and runs it, pulling the artifact across with
+  `COPY --from=build /app/target/*.jar`. `-DskipTests`, because the tests need Postgres and Redis
+  and neither exists during an image build.
+- **Layer ordering that matters.** `COPY pom.xml` and `mvn dependency:go-offline` come *before*
+  `COPY src`, so the dependency layer caches. It took 154.9 seconds the first time and zero on
+  every rebuild since.
+- **`.dockerignore`** — `target/`, `.git/`, `.idea/`, `*.iml`, `.DS_Store`, `docs/`.
+- **`docker-compose.yml`** — three services: `postgres:18`, `redis:8-alpine`, `app`. Healthchecks
+  with `condition: service_healthy`. Named volume on Postgres only. Only `app` publishes 8080.
+- **`application.yaml`** — datasource parameterised: `${DB_HOST:localhost}`, `${DB_NAME:transakt}`,
+  `${DB_USER:aman}`, `${DB_PASSWORD:}`. Local behaviour unchanged; compose supplies its own values.
+
+**Verified 17 Aug 01:54** — `Successfully applied 4 migrations to schema "public", now at version v4`,
+`Started TransaktApplication in 4.43 seconds`, and `curl -i http://localhost:8080/api/v1/health`
+returning 200 from the Mac. V1–V4 ran as real SQL against a completely empty containerised Postgres
+18.6 — no baselining, no shortcuts.
+
+**Why**
+Running Transakt required three manual preconditions: Postgres.app started, `redis-server` alive in
+its own terminal tab, and `JAVA_HOME` pinned to temurin-21. Every one of those is a thing a new
+machine doesn't have and a thing I'd have to explain to anyone I handed the repo to. "Works on my
+machine" is not a property of the code; it's a property of the machine.
+
+There's a second reason, and it's the one that actually forced the work: Day 14 is impossible without
+this. A platform doesn't run your source, it runs an image.
+
+And it closed the loop on Day 12a. That empty containerised Postgres had never seen this project.
+The schema arrived correctly anyway, built from migrations, on infrastructure nobody had configured.
+That's the whole payoff from moving off `ddl-auto`, demonstrated rather than argued.
+
+**Concepts**
+- **Image vs container.** The image is the recipe, the container is the meal. One image, many
+  containers, none of them carrying state that matters.
+- **Multi-stage builds.** The build needs Maven, a full JDK, and ~200 MB of downloaded dependencies.
+  The runtime needs a JRE and one jar. Shipping the first to production means shipping a compiler and
+  a package manager to a machine that should only be running code.
+- **Layer caching, and why instruction order is a design decision.** Docker caches each instruction
+  and invalidates everything below the first change. `COPY src` before dependency resolution would
+  re-download every dependency on every one-character code edit. Splitting the copy in two is the
+  single highest-leverage line in a Dockerfile.
+- **Build context.** Docker ships the entire directory to the daemon *before* running any instruction.
+  Without `.dockerignore` that's the full git history and every compiled class, uploaded on each build
+  to be ignored.
+- **Service names are hostnames.** Inside the compose network, `postgres` resolves. `localhost` does
+  not mean "the host machine" — inside the app container it means the app container.
+- **`depends_on` is not enough.** It waits for the *container* to exist, not for Postgres to accept
+  connections. The app boots in three seconds and would lose that race routinely. Healthchecks with
+  `condition: service_healthy` are load-bearing, not decoration.
+- **Volumes are a statement about what's worth keeping.** Postgres gets a named volume. Redis
+  deliberately doesn't — everything in it has a TTL and is meant to expire.
+- **Publishing ports is opt-in.** Only `app` exposes one. Postgres and Redis stay invisible to the
+  host, which also avoids colliding with Postgres.app on 5432.
+
+**Interview line**
+"I containerised the whole stack — app, Postgres and Redis — so it starts with one command. The two
+details worth explaining are ordering the Dockerfile so the dependency layer caches, which took the
+rebuild from two and a half minutes to nothing, and using healthchecks rather than `depends_on`,
+because `depends_on` only waits for the container to exist and my app boots faster than Postgres
+accepts connections."
+
+**Mistakes & fixes**
+1. **Docker CLI is not the Docker daemon.** `docker --version` and `docker compose version` are local
+   binaries that never contact the engine, so both pass happily while Docker Desktop isn't running.
+   `docker info` is the command that proves the daemon is up — it prints a full Client section, then
+   fails at `Server:`.
+2. **Postgres 18 changed its data directory layout.** The official image now uses major-version
+   subdirectories for `pg_ctlcluster` compatibility, so a volume mounted at
+   `/var/lib/postgresql/data` is reported as an "unused mount/volume" and the container exits 1.
+   Correct config for 18+ is a single mount at `/var/lib/postgresql`, then `docker compose down -v`
+   to clear the half-initialised volume. (docker-library/postgres PR 1259, issue 37.)
+3. **Compose interleaves every container's output.** Redis's startup banner buried Postgres's fatal
+   error completely. `docker compose logs <service>` isolates one.
+4. **IntelliJ creates files relative to the selected Project panel node.** `docker-compose.yml` first
+   landed inside `target/` — gitignored, wiped by `mvn clean`, and excluded by `.dockerignore`. Click
+   the root node first.
+5. **Port 8080 conflict, third occurrence.** `lsof -ti :8080 | xargs kill`.
+
+**Also noted:** Flyway logs a benign warning that PostgreSQL 18.4 is newer than it officially
+supports. It validated every migration anyway. That wants a Flyway bump eventually, not a Postgres
+downgrade.
+
+---
+
+## Day 14 — first deployment (17–23 Aug 2026)
+
+**Live at https://transakt.onrender.com**
+
+**Built**
+- **Platform choice: Render.** Railway has had no free tier since 2023 ($5/month minimum). Render
+  still has a genuine zero-cost path and asks for no card.
+- **Two remaining config gaps** (commit `90a8512`): `server.port: ${PORT:8080}` at the top level, a
+  sibling of `spring:`; and `spring.data.redis.password: ${REDIS_PASSWORD:}` alongside host and port.
+- **Three Render resources:** web service `transakt` (Docker, Free, Singapore, Auto-Deploy on),
+  `transakt-db` (PostgreSQL 18, Free, expires 17 Sept 2026), `transakt-redis` (**Valkey 8**, Free,
+  `allkeys-lru`).
+- **Environment variables:** `DB_HOST`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `JWT_SECRET`,
+  `REDIS_HOST`, `REDIS_PORT`. No `REDIS_PASSWORD` — internal authentication is off, so internal
+  traffic needs none.
+- **Commit `b6045be`** — deleted a `@Bean CommandLineRunner` that had been quietly killing every
+  deploy for three days. See below; it's the whole story of this day.
+
+**Verified in production, 22–23 Aug**
+`GET /health` 200 · signup 200 with a real UUID and hashed key · login 200 with a JWT ·
+`GET /payments` 200, paginated and scoped · `POST /payments` 201 CAPTURED · the same
+`Idempotency-Key` replayed returns the same payment · a 25-request loop returns nineteen 200s then
+six 429s. Nineteen rather than twenty because the payment created moments earlier had already spent
+one slot in that minute — which is itself the proof that the counter is per merchant per minute
+across *all* authenticated endpoints, not per endpoint.
+
+**Why**
+Everything before this was a claim. Fourteen days of architecture that only runs on one laptop is
+indistinguishable, from the outside, from fourteen days of nothing. A URL is evidence.
+
+And it's where Day 12a stops being a design preference and starts being the thing that makes
+deployment possible at all. A fresh managed Postgres, four migration files, and the schema builds
+itself. Without Flyway this day would have begun with hand-running SQL against a production database.
+
+**Concepts**
+- **One artifact, three environments.** Every external address is `${VAR:sensible-default}`. The same
+  image runs on the Mac, in compose, and in Singapore; only the environment differs. The defaults
+  aren't laziness — they're what keeps local development working with zero setup.
+- **Platform-injected PORT.** The host decides the port and tells the app. Binding a hardcoded 8080
+  is a contract the platform never agreed to.
+- **Internal versus external hostnames.** Render gives both. The internal `dpg-…` / `red-…` form
+  never leaves their network and needs no TLS; the external form is public and does. Private
+  networking is per-region, which is why all three services had to be in Singapore.
+- **Free-tier trade-offs, accepted knowingly.** The web service spins down after 15 minutes idle —
+  the first request afterwards measured *over two minutes*, not the 50 seconds advertised. Free
+  Postgres expires 30 days after creation. Neither matters much when the schema rebuilds from
+  migrations and the loss would be demo data.
+- **Valkey.** Render's Key Value is Valkey, the fork created after Redis changed its licence. It's
+  wire-compatible, so Lettuce and Spring Data Redis needed no changes at all.
+- **Reading a deploy log.** "Exited with status 1" is a wrapper, never a cause. Search for `ERROR`,
+  then `Caused by` — don't scroll. And read a Spring stack trace **bottom-up**: the last `Caused by:`
+  is the truth, everything above it is framework plumbing.
+- **`x-render-routing: no-deploy`** means the service has never had a successful deploy. The mystery
+  HTML page served for three days was Render's own 502, not the app.
+- **Defaults are not decisions.** Render's Postgres ships with inbound `0.0.0.0/0`; its Key Value
+  ships blocking all external traffic. Same platform, two opposite security postures, neither of them
+  chosen by me. Worth auditing rather than inheriting.
+
+**Interview line**
+"The deployment itself was routine. What's worth talking about is the three days it took to find the
+failure. Every deploy exited with status 1 and the platform's error message was a wrapper with no
+cause in it. It turned out to be a six-line `CommandLineRunner` I'd added as a debug check on Day 13,
+which pinged Redis at startup. A `CommandLineRunner` runs *after* the context refreshes and Tomcat
+binds — so the image had built, the database had connected, the migrations had applied and the server
+had started, every single time. Then a debug line threw and Spring closed the whole context. The
+failure was at the finish line, which is exactly why nothing upstream looked wrong."
+
+**Mistakes & fixes**
+1. **The three-day outage, and the assumption underneath it.** My notes said the app would boot fine
+   without Redis, reasoning that Lettuce connects lazily and `/health` never touches it. That was
+   wrong, and being wrong about it cost the whole week. Because I believed it, I treated the stuck
+   Redis instance and the failing deploy as *two independent problems* — and spent days debugging
+   ports, build contexts and database config on a failure that Redis was causing all along. The fix
+   was deleting six lines. **A wrong assumption doesn't slow you down; it points you somewhere else
+   entirely.**
+2. **Docker Build Context Directory is a folder, Dockerfile Path is a file.** Pointing the context at
+   `./Dockerfile` produced `invalid local: stat /opt/render/project/src/Dockerfile: not a directory`.
+   Correct values are `.` and `./Dockerfile` respectively.
+3. **Commit `de87094` was a one-line no-op — the intended edits never landed.** Render deploys from
+   GitHub, so an unpushed or unsaved change simply doesn't exist to it. The check that closes this
+   off is `git show origin/main:src/main/resources/application.yaml`, which reads the file *as
+   pushed* rather than the copy on disk.
+4. **The Key Value instance that would never provision.** Two instances hung on "Creating" — one for
+   six hours — and a third couldn't be created at all. That third failure was the clue: the free tier
+   allows one Key Value per workspace, and the stuck one was holding the slot. **Delete first, then
+   create.** The replacement was Available in under five minutes.
+5. **Both auth doors failing identically pointed downstream of both.** With the app finally running,
+   every authenticated endpoint returned an empty-bodied 403 — with a fresh JWT *and* with a fresh
+   API key. Two completely different credential paths failing the same way isn't a coincidence in
+   each; it's one fault after both. It was `RateLimitFilter` reaching for a Redis that didn't exist
+   yet. Testing both doors separately is what split the problem.
+6. **A signal that carries two meanings proves neither.** Those 403s came with a `JSESSIONID`, which
+   I first read as proof the request had arrived unauthenticated. It isn't: in Spring Security 6 the
+   context is persisted to a session when a filter *sets* an Authentication, so the cookie appears
+   either way. The log settled it in ten seconds; the inference had been leading the wrong direction
+   for twenty minutes.
+7. **A sudden 403 mid-test, again.** Same lesson as Day 9, learned again the hard way: the token had
+   passed its one-hour expiry. Check the token age before anything else.
+8. **An interactive prompt is not a shell.** Twice during SSH setup, the next command was pasted in
+   as the *answer* to a question — once to `ssh-keygen`'s "where to save the key", once to ssh's
+   "continue connecting?". Terminal looks identical either way. If the line ends in `?` or `:` rather
+   than `%`, answer it first. Passphrase prompts also echo nothing while you type, which reads as a
+   frozen window.
+9. **GitHub HTTPS credentials expire.** `Password authentication is not supported for Git
+   operations`. Switched the remote to SSH with an ed25519 key, which doesn't expire.
+
+**Still open**
+- The Redis failure surfaced as an empty-bodied **403 rather than a 500**. `RateLimitFilter` is
+  registered before `UsernamePasswordAuthenticationFilter`, so it runs upstream of
+  `ExceptionTranslationFilter` and an uncaught throw should have escaped as a 500. Something is
+  catching it. Worth finding — and the design question underneath is worth answering deliberately:
+  **when the rate limiter's store is unreachable, fail open or fail closed?** Failing closed turns a
+  Redis outage into a total outage. Failing open drops the ceiling exactly when the system is already
+  unhealthy. And the answer probably shouldn't be the same for idempotency, where failing open means
+  charging a customer twice.
+- **Still no CI.** Nineteen tests that run when someone remembers to run them. This is now the
+  largest gap in the project.

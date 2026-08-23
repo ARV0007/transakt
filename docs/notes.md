@@ -1180,4 +1180,456 @@ saved.setApiKey(apiKey);
 return saved;
 ```
 
-Invisible while `apiKey` was a mapped column. Making it `@Transient` is what exposed it.
+Invisible while `apiKey` was a mapped column. Making it `@Transient` is what exposed it.---
+
+## Day 13 — Containers
+
+### The problem
+
+Running Transakt required three things to be true about the machine before a single line of code
+executed: Postgres.app started, `redis-server` alive in its own terminal tab, and `JAVA_HOME` pointing
+at temurin-21 rather than whatever JDK the shell picked up.
+
+None of those is in the repository. All of them are in my head. Hand the repo to someone else and the
+first thing they get is a stack trace, followed by a conversation.
+
+"Works on my machine" is not a property of the code. It is a property of the machine.
+
+There is a second reason, and it is the one that actually forced the work: a hosting platform does not
+run your source. It runs an image. Day 14 is impossible without Day 13.
+
+### Image versus container
+
+An **image** is a read-only template — a filesystem plus the instruction for what to run. A
+**container** is one running instance of it.
+
+The relationship is class-to-object. One image, many containers, and none of them should hold state
+that matters, because containers are meant to be disposable. Anything you cannot afford to lose goes
+in a volume or a database, not in the container's filesystem.
+
+### Multi-stage builds
+
+The `Dockerfile` has two `FROM` lines:
+
+```dockerfile
+FROM maven:3.9-eclipse-temurin-21 AS build
+# ... compile the jar ...
+
+FROM eclipse-temurin:21-jre
+COPY --from=build /app/target/*.jar app.jar
+```
+
+The build needs Maven, a full JDK, and roughly two hundred megabytes of downloaded dependencies. The
+runtime needs a JRE and one jar file. `COPY --from=build` reaches into the first stage, takes the one
+artifact that matters, and leaves everything else behind — the compiler, the package manager, the
+dependency cache, the source code.
+
+Two reasons this matters beyond image size. A smaller image pulls and starts faster, which is felt on
+every deploy. And a production container that contains a compiler and a package manager is a
+container where an attacker who gets a foothold has tools to work with.
+
+`-DskipTests` in the build stage is deliberate: the tests need Postgres and Redis, and neither exists
+during an image build. Tests belong in CI, before the image is built.
+
+### Layer caching, and why instruction order is a design decision
+
+Docker caches the result of each instruction. When you rebuild, it reuses cached layers until it hits
+the first instruction whose inputs changed — and then it re-runs that one **and everything below it**.
+
+So this order is wrong:
+
+```dockerfile
+COPY . .
+RUN mvn dependency:go-offline
+```
+
+Change one character of one Java file and `COPY . .` is invalidated, so the dependency download runs
+again. Every build. For a one-line edit.
+
+And this order is right:
+
+```dockerfile
+COPY pom.xml .
+RUN mvn dependency:go-offline
+COPY src ./src
+RUN mvn package -DskipTests
+```
+
+`pom.xml` only changes when dependencies change, so the download layer stays cached across every code
+edit. It took 154.9 seconds the first time and zero on every rebuild since.
+
+The general rule: **order Dockerfile instructions from least-frequently-changed to
+most-frequently-changed.** It is the highest-leverage decision in the file, and it looks like
+formatting.
+
+### The build context
+
+Before running a single instruction, Docker packages up the directory you point it at and ships the
+whole thing to the daemon. That is the **build context**.
+
+Without a `.dockerignore`, that means uploading `target/` (every compiled class), `.git/` (the entire
+project history), and `.idea/` — on every build — so that the Dockerfile can ignore them.
+
+```
+target/
+.git/
+.idea/
+*.iml
+.DS_Store
+docs/
+```
+
+Same idea as `.gitignore`, different consumer.
+
+### Compose: service names are hostnames
+
+`docker-compose.yml` puts three services on a shared network, and **the service name is its
+hostname**. The app reaches Postgres at `postgres`, not at an IP address and not at `localhost`.
+
+That last point is where almost everyone gets caught. **Inside a container, `localhost` means that
+container.** Not the host machine, not the other containers. An app container looking for Postgres on
+`localhost:5432` is looking inside itself, finding nothing, and reporting connection refused —
+which is exactly the error you would get if Postgres were down, so the message points the wrong way.
+
+Which is also why every address had to become `${DB_HOST:localhost}` rather than a literal. Same code,
+different neighbours.
+
+### `depends_on` is not readiness
+
+```yaml
+depends_on:
+  postgres:
+    condition: service_healthy
+```
+
+`depends_on` on its own waits for the container to **exist**. It does not wait for Postgres to finish
+initialising and start accepting connections — which takes several seconds on first run, while this
+app boots in three.
+
+So without a healthcheck the app wins that race routinely, fails to connect, and exits. Intermittently.
+Which is the worst kind, because it works often enough to look like a fluke.
+
+A healthcheck plus `condition: service_healthy` makes the dependency real: compose runs `pg_isready`
+until it passes, and only then starts the app.
+
+**"It exists" and "it's ready" are different claims,** and orchestration tools distinguish them for
+this reason. Kubernetes has the same split — liveness versus readiness probes.
+
+### Volumes are a statement about what matters
+
+Postgres gets a named volume. Redis deliberately does not.
+
+That is not an oversight, it is the Day 10 design restated in infrastructure: Postgres holds the truth
+and losing it is a disaster; Redis holds facts that expire on their own and losing them costs a rate
+window and a day of idempotency keys. If the data is supposed to vanish anyway, persisting it across
+container restarts is work with no payoff.
+
+### Publishing ports is opt-in
+
+Only the app publishes 8080. Postgres and Redis are reachable from other containers on the compose
+network and invisible from the host.
+
+Two benefits. Nothing on my laptop can accidentally connect to the containerised database instead of
+the real one. And 5432 stays free for Postgres.app, which is still running.
+
+Default-closed, same instinct as Spring Security.
+
+### What the first containerised run actually proved
+
+```
+Successfully applied 4 migrations to schema "public", now at version v4
+Started TransaktApplication in 4.43 seconds
+```
+
+That Postgres container had existed for eleven seconds and had never seen this project. V1 through V4
+ran as real SQL — no baselining, no shortcuts — and the schema arrived correct on infrastructure
+nobody had configured.
+
+That is Day 12a's argument, demonstrated rather than asserted. Before Flyway, standing up a new
+database meant either `ddl-auto` guessing or someone running SQL by hand. Now it is a side effect of
+starting the app.
+
+---
+
+## Day 14 — Deployment
+
+### The problem
+
+Fourteen days of architecture that only runs on one laptop is, from the outside, indistinguishable
+from fourteen days of nothing. Everything before this point was a claim. A URL is evidence.
+
+### One artifact, three environments
+
+Every external address in `application.yaml` is now `${VAR:sensible-default}` — database host, name,
+user, password; Redis host, port, password; the HTTP port; the JWT secret; the rate limit.
+
+The same jar and the same image run on a MacBook, inside docker-compose, and in Singapore. Only the
+environment differs.
+
+The defaults are the part worth explaining. They are not laziness — they are what keeps local
+development at zero setup. With nothing set at all, the app looks for Postgres and Redis on localhost,
+which is exactly where they are on this machine. Compose overrides the hosts with service names.
+Render overrides them with managed hostnames.
+
+Notice what is **absent**: there is no `application-prod.yaml`, and nothing in the code branches on an
+environment name. A production profile would be a fourth thing to keep in sync, and every value it
+would hold is already a variable. The Twelve-Factor App phrasing for this is "store config in the
+environment" — the reason being that config varies between deploys while code does not, so anything
+that varies should not be baked into the artifact.
+
+### The platform chooses the port
+
+```yaml
+server:
+  port: ${PORT:8080}
+```
+
+Top level, column zero, a sibling of `spring:` — not nested under it, which is easy to get wrong
+because almost everything else is.
+
+The host decides which port to route traffic to and passes it in as an environment variable. Binding a
+hardcoded 8080 is a contract the platform never agreed to. This is standard across Render, Heroku,
+Cloud Run and Fly, and it is a one-line change that is invisible until the day it isn't.
+
+### Internal and external hostnames
+
+Managed databases hand you two addresses, and the difference is not cosmetic.
+
+| | Internal | External |
+|---|---|---|
+| Shape | `dpg-xxxxx` | `dpg-xxxxx.singapore-postgres.render.com` |
+| Reachable from | inside the provider's network | anywhere |
+| TLS | not needed | required |
+| Latency | same datacentre | over the internet |
+
+Use the internal one whenever both ends are on the same platform. The traffic never touches the public
+internet, so there is nothing to encrypt and nothing exposed.
+
+The catch that dictates architecture: **private networking is per-region.** An internal hostname
+resolves only from inside the region it lives in. All three Transakt services are in Singapore for
+that reason, not for latency.
+
+### Valkey
+
+Render's Key Value store runs **Valkey 8**, not Redis. Valkey is the fork that appeared after Redis
+Ltd. changed the licence in 2024 — the Linux Foundation adopted the last open-source commit and
+development continued from there. AWS, Google and Oracle went the same way.
+
+Practically: it speaks the same wire protocol, so Lettuce and Spring Data Redis needed no change at
+all. Worth knowing the name exists, because a dashboard saying "Valkey" when your dependency says
+"redis" looks alarming for a moment.
+
+### What "free" actually costs
+
+Two properties of the free tier that are better stated than discovered.
+
+**The web service spins down after fifteen minutes idle.** The first request afterwards has to start a
+container from cold. Render advertises around fifty seconds; a measured cold start here took **over two
+minutes**. That is fine for a portfolio link and unusable for anything real — but only if you say so
+when you share it, otherwise the reviewer's first impression is that your API is broken.
+
+**The managed Postgres expires thirty days after creation**, with a fourteen-day grace period and then
+permanent deletion. This matters much less than it sounds, and the reason is Flyway: the schema
+rebuilds itself from four files on any empty database, so the loss is demo data rather than capability.
+That is a concrete return on Day 12a that would have been an abstract argument otherwise.
+
+### Defaults are not decisions
+
+The managed Postgres shipped with an inbound rule of `0.0.0.0/0` — accepting connections from the
+entire internet with only a password in front of it. The Key Value store, from the same provider, ships
+blocking all external traffic.
+
+Same platform, opposite postures, neither of them chosen by me.
+
+The lesson generalises past this provider: **a default is what the vendor found convenient, not what
+your system needs.** Anything security-relevant is worth reading once and deciding about deliberately,
+even if the decision is to keep it.
+
+---
+
+## A startup hook is not free
+
+This is the most expensive thing I learned in fourteen days, and it is six lines long.
+
+```java
+@Bean
+CommandLineRunner redisCheck(StringRedisTemplate redis) {
+    return args -> {
+        redis.opsForValue().set("startup-check", "ok");
+        System.out.println(">>> Redis says: " + redis.opsForValue().get("startup-check"));
+    };
+}
+```
+
+Written on Day 13 to confirm the compose wiring worked. It printed `>>> Redis says: ok`, did its job,
+and stayed in the file.
+
+### When a runner actually runs
+
+`SpringApplication.run` does roughly this, in order:
+
+1. create the context and register every bean
+2. **refresh** the context — build all singletons, start embedded Tomcat, bind the port
+3. **`callRunners`** — invoke every `CommandLineRunner` and `ApplicationRunner`
+
+Step 3 is last. By the time a runner executes, the application is completely up: migrations applied,
+connection pool built, Tomcat listening.
+
+And if a runner throws, `SpringApplication` calls `handleRunFailure` — which logs
+`Application run failed`, **closes the context**, and rethrows so the JVM exits non-zero.
+
+### Why that ordering is the trap
+
+On Render, with no Redis, every deploy went like this:
+
+- the image built ✓
+- the container started ✓
+- Postgres connected ✓
+- Flyway applied V1–V4 ✓
+- Tomcat bound the port ✓
+- the runner threw ✗
+- the context closed, exit 1
+
+**Everything succeeded and then the process died anyway.** The platform reported "Exited with status 1
+while running your code", which is true and useless. Nothing upstream looked wrong because nothing
+upstream *was* wrong.
+
+Three days went into ports, build contexts and database configuration on a failure that had already
+passed all of those.
+
+### The real lesson
+
+Debug scaffolding that touches an external service is not neutral. It **converts an optional dependency
+into a hard startup requirement.**
+
+Redis is optional for booting this application by design — Lettuce connects lazily, `/health` never
+touches it, and an app that can start and report itself unhealthy is more useful than one that
+crash-loops. That runner silently revoked that property, and nothing in the code said so.
+
+Worth carrying:
+
+- **A runner is production code.** It runs on every start, in every environment, forever.
+- **If a startup check must exist, it must not be fatal.** Catch, log a warning, carry on. Or better,
+  make it a health indicator, which is the thing designed for reporting "this dependency is down"
+  without taking the process with it.
+- **`@PostConstruct` is worse, not better.** It runs during bean creation, inside the refresh — so a
+  throw there fails the context even earlier, with the same result and less log to read.
+
+---
+
+## Reading a failure you weren't there for
+
+Local debugging has a debugger, breakpoints and the ability to try again instantly. A failing deploy
+has a log file and a five-minute feedback loop. Different skill, and this week was the first real
+practice at it.
+
+### The platform's error message is a wrapper
+
+`Exited with status 1 while running your code` describes what the operating system observed. It
+contains no cause and never will. Neither does `Build failed` or `Deploy failed`.
+
+The cause is in the application log, always. The platform message tells you *which* log to open, and
+nothing more.
+
+### Read a stack trace bottom-up
+
+A Spring failure produces sixty lines of framework plumbing above the one line that matters. The
+convention is that each `Caused by:` unwraps one layer, so the **last** one is the root cause:
+
+```
+Caused by: io.lettuce.core.RedisConnectionException: Unable to connect to localhost:6379
+Caused by: io.netty.channel.AbstractChannel$AnnotatedConnectException: Connection refused
+Caused by: java.net.ConnectException: Connection refused
+```
+
+Read upward from the bottom: a raw TCP connect was refused → Netty wrapped it and named the address →
+Lettuce wrapped that and named the subsystem. The bottom line is what happened; the ones above are
+increasingly abstract descriptions of it.
+
+### Search the log, don't scroll it
+
+A deploy log is mostly Maven downloading dependencies. Scrolling it is a waste of a five-minute
+feedback loop.
+
+Two searches find the answer almost every time:
+
+1. **`ERROR`** — locates the failure and its timestamp
+2. **`Caused by`** — extracts the root cause chain directly, skipping the plumbing
+
+That is the difference between reading a log and searching one, and it took twenty minutes of scrolling
+to learn.
+
+### Two doors failing identically points downstream of both
+
+Once the app was finally running, every authenticated endpoint returned an empty-bodied 403 — with a
+freshly minted JWT **and** with a freshly created API key.
+
+Two completely separate credential paths failing in exactly the same way is not two coincidences. It is
+one fault located *after* both of them. That reframing is what turned an open-ended "authentication is
+broken" into a specific question about what runs next in the chain — which was `RateLimitFilter`,
+reaching for a Redis that did not exist yet.
+
+**Testing both paths separately is a bisection tool.** If one had worked, the fault was in the other;
+both failing meant it was downstream. Either answer halves the search.
+
+### A signal that carries two meanings proves neither
+
+Those 403s came with a `Set-Cookie: JSESSIONID`, and I read that as proof the request had arrived
+unauthenticated — Spring Security creating a session while saving the request for a post-login
+redirect.
+
+It is not proof. In Spring Security 6 the SecurityContext is also persisted to a session when a filter
+**successfully sets** an Authentication, unless the config is explicitly stateless. The cookie appears
+either way.
+
+I spent twenty minutes reasoning from it in the wrong direction. The log settled it in ten seconds.
+
+**Before drawing a conclusion from a signal, ask what else could produce it.** If the answer is "the
+opposite thing," it is not evidence.
+
+### The assumption cost more than the bug
+
+The bug was six lines and would have taken an hour to find had I been looking in the right place.
+
+I was not looking in the right place because my own notes said the app boots fine without Redis. So the
+stuck Redis instance and the failing deploy were filed as *two independent problems*, and I debugged
+the second one for three days.
+
+**A wrong assumption does not slow you down — it points you somewhere else entirely.** The mitigation
+is cheap and I did not do it: when several things fail at once, check whether they are actually one
+thing before treating them separately.
+
+---
+
+## Fail open or fail closed
+
+Left over from Day 14, and worth thinking through properly rather than discovering by accident.
+
+When Redis was unreachable, authenticated requests returned an **empty-bodied 403**. Not a 500, not a
+deliberate 503 — 403, with no body, which is the same thing a permissions failure returns. Something in
+the chain catches the `RedisConnectionException` and converts it, and that behaviour was never chosen.
+
+Which raises the actual question: **when the store behind a control is down, should the control let
+requests through or turn them away?**
+
+**Fail closed** — reject everything. Safe in the sense that the guarantee is never violated. But it
+converts a Redis outage into a total outage, and Redis is the least durable component in the system.
+The control designed to protect availability becomes the thing that destroys it.
+
+**Fail open** — allow everything, log loudly. The service stays up. But the ceiling disappears at
+exactly the moment the system is already unhealthy, which is when a retry storm is most likely.
+
+For **rate limiting**, fail open is the usual answer. The limiter exists to protect against
+degradation, and taking the whole API down is a worse degradation than any it prevents. Cloudflare and
+most CDNs behave this way.
+
+For **idempotency**, the calculation inverts. Failing open means a retry creates a second payment, and
+a customer is charged twice. That is not a degradation, it is the exact harm the feature exists to
+prevent. Here failing closed — refuse the write, tell the client to retry later — is the correct trade,
+and it is the argument for storing idempotency keys in Postgres with a unique index rather than in
+Redis at all: the guarantee then lives in the same transaction as the payment and cannot fail
+separately from it.
+
+**Same infrastructure, same failure, opposite correct answers.** The deciding question is not "how do I
+handle the error" but "what is the worst thing that happens if this control silently stops working" —
+and for these two features, those answers are nothing alike.
