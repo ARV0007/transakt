@@ -657,3 +657,273 @@ failure was at the finish line, which is exactly why nothing upstream looked wro
   charging a customer twice.
 - **Still no CI.** Nineteen tests that run when someone remembers to run them. This is now the
   largest gap in the project.
+
+
+---
+
+## Day 16 — the 403 that was hiding a 500, and a resilience decision (24 Aug 2026)
+
+**Commits:** `34419da` — "fix: permit /error so failures report their real cause"
+`19a1c53` — "test: assert the rate limiter fails open when Redis is down"
+
+**Built**
+- **`.requestMatchers("/error").permitAll()`** as the first matcher in `SecurityConfig` — one line.
+- **`RateLimitService.isAllowed` now fails open.** The Redis calls are wrapped in a `try`, the
+  `catch` is `RedisConnectionFailureException` specifically, and it logs an `@Slf4j` warning naming
+  the merchant before returning `true`.
+- **`RateLimitServiceTest`** — the project's first genuine unit test, asserting that a request is
+  allowed when Redis throws.
+
+**Verified end to end.** With Redis stopped and the app running locally:
+`HTTP/1.1 403` before the first fix, `HTTP/1.1 500` with a real JSON body after it, and
+`HTTP/1.1 200` plus a `WARN` line after the second. Three states, same request, in the space of
+half an hour. `./mvnw test` → **Tests run: 20, Failures: 0**.
+
+---
+
+### Part one — the 403 that was hiding a 500
+
+**Why**
+Since Day 14 a Redis outage had produced an empty-bodied 403 on every authenticated endpoint. That
+is a lie in two directions at once: it implies a permissions problem, and it hides an outage. Anyone
+debugging it — including me, for three days on Render — starts by looking at credentials.
+
+**What it turned out to be, and it wasn't what I predicted.** I was sure something was catching the
+`RedisConnectionFailureException` and converting it. Nothing was. `grep -rn "catch"` across all three
+filters returned exactly one hit, in `JwtAuthFilter`, and `filterChain.doFilter` sits *outside* that
+try block — so it can only ever catch its own JWT parsing, never anything downstream.
+
+The real sequence, from the stack trace:
+
+1. `RateLimitService.isAllowed` calls INCR, Redis is gone, the exception is thrown
+2. It escapes every filter and reaches Tomcat — the trace shows no `catch` anywhere on the way up
+3. Tomcat sets **500** and dispatches internally to `/error`
+4. **That dispatch runs through the security filter chain again** — it is a fresh request
+5. But `JwtAuthFilter` and `ApiKeyFilter` extend `OncePerRequestFilter`, whose
+   `shouldNotFilterErrorDispatch()` returns `true` by default. **They skip error dispatches.**
+6. So `/error` arrives with nobody authenticated, `anyRequest().authenticated()` denies it, and the
+   resulting **403 overwrites the 500** the client never sees
+
+**The error page, whose entire job is reporting failures, was itself failing a permissions check.**
+
+That also closed the two things that had puzzled me on Render two days earlier: the empty body (a
+Spring Security denial has none) and the `JSESSIONID` (the anonymous-denial path saves the request
+for a post-login redirect). Both were signatures of the *error dispatch*, not of the original
+request.
+
+**Concepts**
+- **An error dispatch is a new request through the whole chain.** Spring Boot registers the security
+  filter chain for `REQUEST`, `ERROR` and `ASYNC` — but `OncePerRequestFilter` opts out of the error
+  case by default. That asymmetry is the entire bug.
+- **`/error` needs `permitAll`** in any app with `anyRequest().authenticated()`. Otherwise every
+  unhandled exception in the application comes back as a permissions failure.
+- **A status code can be overwritten after it's set.** The 500 was real for the whole three days; it
+  just never reached the client.
+
+---
+
+### Part two — fail open or fail closed
+
+**Why**
+Fixing the visibility left the behaviour still wrong. A Redis outage produced a 500 on every
+authenticated request — honest, but it meant **losing the cache took the entire API down**, including
+reads that don't need Redis at all. The rate limiter exists to protect availability, and in that
+state it was the single thing destroying it.
+
+**The decision: fail open.** When the store is unreachable, the request is allowed and a warning is
+logged.
+
+The reasoning is that a control protecting availability must never itself become the cause of an
+outage. Failing closed converts a cache outage into a total outage — and Redis is the least durable
+component in the system, so that trade is badly priced. Cloudflare and most CDN rate limiters behave
+the same way.
+
+**And the answer is different for idempotency**, which is the part worth understanding. Letting a
+request past a dead rate limiter costs a burst of traffic. Letting a retry past a dead idempotency
+check **charges a customer twice** — the exact harm the feature exists to prevent. Same
+infrastructure, same failure mode, opposite correct answers. That asymmetry is also the strongest
+argument for eventually moving idempotency keys into Postgres with a unique index, written inside the
+payment transaction, where they cannot fail independently of the payment they protect.
+
+**Concepts**
+- **Catch the specific exception.** `RedisConnectionFailureException` means one thing: the store is
+  unreachable. `catch (Exception e)` would also swallow a bug in the key-building code and silently
+  let everything through — a rate limiter that has quietly stopped limiting, with no signal.
+- **Fail-open without a log is silent degradation.** The `WARN` line is what makes the difference
+  between a deliberate trade-off and a control that stopped working without telling anyone.
+- **The right question is not "how do I handle this error."** It's "what is the worst thing that
+  happens if this control silently stops working?" For rate limiting, a traffic spike. For
+  idempotency, a double charge. Ask it per feature, not per dependency.
+- **This is where a unit test is correct** — and it's the opposite of the Day 11 argument. Integration
+  tests won then because the behaviour lived in the wiring. Here the behaviour is one catch block, and
+  exercising it requires Redis to fail *on demand*, which a mocked `StringRedisTemplate` does cleanly
+  and a real one does not. Same principle both times: test at the level where the behaviour actually
+  lives.
+
+**Interview line**
+"A Redis outage was returning 403 on every authenticated endpoint, which reads as a permissions
+problem and isn't. Nothing was catching the exception — Tomcat was setting 500 and dispatching to
+`/error`, and because `OncePerRequestFilter` skips error dispatches, that dispatch arrived
+unauthenticated and got denied. The error page was failing its own permissions check and overwriting
+the real status. One line fixed the visibility. Then the actual design question: should the rate
+limiter fail open or closed? I went open, because a control that protects availability shouldn't
+cause an outage — but deliberately kept the opposite answer for idempotency, where failing open means
+charging someone twice."
+
+**Mistakes & fixes**
+1. **I predicted the wrong cause and said so with confidence.** The theory was a `try/catch` wrapping
+   `chain.doFilter` in an auth filter — plausible, and wrong. What settled it was reproducing the
+   failure locally with a debugger attached instead of reasoning from a remote log. **Local
+   reproduction of a remote bug is worth the setup cost**: full stack trace, no truncation, instant
+   retry.
+2. **`git commit` skipped in a `&&` chain.** `cp` failed silently, but `git add && git commit && git
+   push` ran anyway on an unchanged file and reported success. **`&&` only stops on the failure of the
+   command immediately before it** — check the insertion count, not the exit code.
+3. **Wrong directory again** (5th time): `fatal: not a git repository` from `~`. The alias exists;
+   the habit doesn't yet.
+4. **Redis left stopped after testing**, so the next `./mvnw test` failed with seven errors in
+   `clearRedis` — the Day 11 `@BeforeEach flushDb()`. Not a regression: the integration tests
+   correctly refuse to run in a broken environment. Worth noting the contrast, though — **the test
+   suite fails loudly when Redis is missing while the application now degrades quietly. Both are
+   right, for opposite reasons.**
+
+**Still open**
+- Idempotency keys still live in Redis and still inherit its durability. Moving them to Postgres with
+  a unique index inside the payment transaction is the proper fix.
+- The `catch (Exception e)` in `JwtAuthFilter` is wider than it needs to be. It should be
+  `JwtException` — a `NullPointerException` in `extractRole` would currently deauthenticate silently
+  rather than failing loudly.
+---
+
+## Day 16 — the 403 that was hiding a 500, and a resilience decision (24 Aug 2026)
+
+**Commits:** `34419da` — "fix: permit /error so failures report their real cause"
+`19a1c53` — "test: assert the rate limiter fails open when Redis is down"
+
+**Built**
+- **`.requestMatchers("/error").permitAll()`** as the first matcher in `SecurityConfig` — one line.
+- **`RateLimitService.isAllowed` now fails open.** The Redis calls are wrapped in a `try`, the
+  `catch` is `RedisConnectionFailureException` specifically, and it logs an `@Slf4j` warning naming
+  the merchant before returning `true`.
+- **`RateLimitServiceTest`** — the project's first genuine unit test, asserting that a request is
+  allowed when Redis throws.
+
+**Verified end to end.** With Redis stopped and the app running locally:
+`HTTP/1.1 403` before the first fix, `HTTP/1.1 500` with a real JSON body after it, and
+`HTTP/1.1 200` plus a `WARN` line after the second. Three states, same request, in the space of
+half an hour. `./mvnw test` → **Tests run: 20, Failures: 0**.
+
+---
+
+### Part one — the 403 that was hiding a 500
+
+**Why**
+Since Day 14 a Redis outage had produced an empty-bodied 403 on every authenticated endpoint. That
+is a lie in two directions at once: it implies a permissions problem, and it hides an outage. Anyone
+debugging it — including me, for three days on Render — starts by looking at credentials.
+
+**What it turned out to be, and it wasn't what I predicted.** I was sure something was catching the
+`RedisConnectionFailureException` and converting it. Nothing was. `grep -rn "catch"` across all three
+filters returned exactly one hit, in `JwtAuthFilter`, and `filterChain.doFilter` sits *outside* that
+try block — so it can only ever catch its own JWT parsing, never anything downstream.
+
+The real sequence, from the stack trace:
+
+1. `RateLimitService.isAllowed` calls INCR, Redis is gone, the exception is thrown
+2. It escapes every filter and reaches Tomcat — the trace shows no `catch` anywhere on the way up
+3. Tomcat sets **500** and dispatches internally to `/error`
+4. **That dispatch runs through the security filter chain again** — it is a fresh request
+5. But `JwtAuthFilter` and `ApiKeyFilter` extend `OncePerRequestFilter`, whose
+   `shouldNotFilterErrorDispatch()` returns `true` by default. **They skip error dispatches.**
+6. So `/error` arrives with nobody authenticated, `anyRequest().authenticated()` denies it, and the
+   resulting **403 overwrites the 500** the client never sees
+
+**The error page, whose entire job is reporting failures, was itself failing a permissions check.**
+
+That also closed the two things that had puzzled me on Render two days earlier: the empty body (a
+Spring Security denial has none) and the `JSESSIONID` (the anonymous-denial path saves the request
+for a post-login redirect). Both were signatures of the *error dispatch*, not of the original
+request.
+
+**Concepts**
+- **An error dispatch is a new request through the whole chain.** Spring Boot registers the security
+  filter chain for `REQUEST`, `ERROR` and `ASYNC` — but `OncePerRequestFilter` opts out of the error
+  case by default. That asymmetry is the entire bug.
+- **`/error` needs `permitAll`** in any app with `anyRequest().authenticated()`. Otherwise every
+  unhandled exception in the application comes back as a permissions failure.
+- **A status code can be overwritten after it's set.** The 500 was real for the whole three days; it
+  just never reached the client.
+
+---
+
+### Part two — fail open or fail closed
+
+**Why**
+Fixing the visibility left the behaviour still wrong. A Redis outage produced a 500 on every
+authenticated request — honest, but it meant **losing the cache took the entire API down**, including
+reads that don't need Redis at all. The rate limiter exists to protect availability, and in that
+state it was the single thing destroying it.
+
+**The decision: fail open.** When the store is unreachable, the request is allowed and a warning is
+logged.
+
+The reasoning is that a control protecting availability must never itself become the cause of an
+outage. Failing closed converts a cache outage into a total outage — and Redis is the least durable
+component in the system, so that trade is badly priced. Cloudflare and most CDN rate limiters behave
+the same way.
+
+**And the answer is different for idempotency**, which is the part worth understanding. Letting a
+request past a dead rate limiter costs a burst of traffic. Letting a retry past a dead idempotency
+check **charges a customer twice** — the exact harm the feature exists to prevent. Same
+infrastructure, same failure mode, opposite correct answers. That asymmetry is also the strongest
+argument for eventually moving idempotency keys into Postgres with a unique index, written inside the
+payment transaction, where they cannot fail independently of the payment they protect.
+
+**Concepts**
+- **Catch the specific exception.** `RedisConnectionFailureException` means one thing: the store is
+  unreachable. `catch (Exception e)` would also swallow a bug in the key-building code and silently
+  let everything through — a rate limiter that has quietly stopped limiting, with no signal.
+- **Fail-open without a log is silent degradation.** The `WARN` line is what makes the difference
+  between a deliberate trade-off and a control that stopped working without telling anyone.
+- **The right question is not "how do I handle this error."** It's "what is the worst thing that
+  happens if this control silently stops working?" For rate limiting, a traffic spike. For
+  idempotency, a double charge. Ask it per feature, not per dependency.
+- **This is where a unit test is correct** — and it's the opposite of the Day 11 argument. Integration
+  tests won then because the behaviour lived in the wiring. Here the behaviour is one catch block, and
+  exercising it requires Redis to fail *on demand*, which a mocked `StringRedisTemplate` does cleanly
+  and a real one does not. Same principle both times: test at the level where the behaviour actually
+  lives.
+
+**Interview line**
+"A Redis outage was returning 403 on every authenticated endpoint, which reads as a permissions
+problem and isn't. Nothing was catching the exception — Tomcat was setting 500 and dispatching to
+`/error`, and because `OncePerRequestFilter` skips error dispatches, that dispatch arrived
+unauthenticated and got denied. The error page was failing its own permissions check and overwriting
+the real status. One line fixed the visibility. Then the actual design question: should the rate
+limiter fail open or closed? I went open, because a control that protects availability shouldn't
+cause an outage — but deliberately kept the opposite answer for idempotency, where failing open means
+charging someone twice."
+
+**Mistakes & fixes**
+1. **I predicted the wrong cause and said so with confidence.** The theory was a `try/catch` wrapping
+   `chain.doFilter` in an auth filter — plausible, and wrong. What settled it was reproducing the
+   failure locally with a debugger attached instead of reasoning from a remote log. **Local
+   reproduction of a remote bug is worth the setup cost**: full stack trace, no truncation, instant
+   retry.
+2. **`git commit` skipped in a `&&` chain.** `cp` failed silently, but `git add && git commit && git
+   push` ran anyway on an unchanged file and reported success. **`&&` only stops on the failure of the
+   command immediately before it** — check the insertion count, not the exit code.
+3. **Wrong directory again** (5th time): `fatal: not a git repository` from `~`. The alias exists;
+   the habit doesn't yet.
+4. **Redis left stopped after testing**, so the next `./mvnw test` failed with seven errors in
+   `clearRedis` — the Day 11 `@BeforeEach flushDb()`. Not a regression: the integration tests
+   correctly refuse to run in a broken environment. Worth noting the contrast, though — **the test
+   suite fails loudly when Redis is missing while the application now degrades quietly. Both are
+   right, for opposite reasons.**
+
+**Still open**
+- Idempotency keys still live in Redis and still inherit its durability. Moving them to Postgres with
+  a unique index inside the payment transaction is the proper fix.
+- The `catch (Exception e)` in `JwtAuthFilter` is wider than it needs to be. It should be
+  `JwtException` — a `NullPointerException` in `extractRole` would currently deauthenticate silently
+  rather than failing loudly.
