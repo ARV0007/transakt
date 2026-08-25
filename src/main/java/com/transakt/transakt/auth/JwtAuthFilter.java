@@ -1,5 +1,6 @@
 package com.transakt.transakt.auth;
 
+import io.jsonwebtoken.JwtException;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
@@ -52,7 +53,7 @@ public class JwtAuthFilter extends OncePerRequestFilter {
                         new UsernamePasswordAuthenticationToken(merchantId, null, authorities);
                 SecurityContextHolder.getContext().setAuthentication(auth);
 
-            } catch (Exception e) {
+            } catch (JwtException | IllegalArgumentException e) {
                 SecurityContextHolder.clearContext();
             }
         }
