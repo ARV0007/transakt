@@ -4,6 +4,7 @@ import com.transakt.transakt.common.IdempotencyConflictException;
 import com.transakt.transakt.common.IdempotencyService;
 import com.transakt.transakt.ledger.LedgerEntry;
 import jakarta.validation.Valid;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.data.domain.Page;
@@ -11,6 +12,7 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
 import org.springframework.data.web.PageableDefault;
 import java.util.List;
+import java.util.Optional;
 
 @RestController
 @RequestMapping("/api/v1/payments")
@@ -33,25 +35,20 @@ public class PaymentController {
         String merchantId = authentication.getName();
 
         if (idempotencyKey == null || idempotencyKey.isBlank()) {
-            return paymentService.create(buildPayment(request, merchantId));
+            return paymentService.create(buildPayment(request, merchantId), null);
         }
 
-        if (!idempotencyService.tryReserve(merchantId, idempotencyKey)) {
-            String stored = idempotencyService.getStoredValue(merchantId, idempotencyKey);
-            if (stored == null || IdempotencyService.IN_PROGRESS.equals(stored)) {
-                throw new IdempotencyConflictException(
-                        "A request with this Idempotency-Key is already in progress");
-            }
-            return paymentService.getById(stored, merchantId, false);
+        Optional<String> existing = idempotencyService.findPaymentId(merchantId, idempotencyKey);
+        if (existing.isPresent()) {
+            return paymentService.getById(existing.get(), merchantId, false);
         }
 
         try {
-            Payment saved = paymentService.create(buildPayment(request, merchantId));
-            idempotencyService.storeResult(merchantId, idempotencyKey, saved.getId());
-            return saved;
-        } catch (RuntimeException e) {
-            idempotencyService.release(merchantId, idempotencyKey);
-            throw e;
+            return paymentService.create(buildPayment(request, merchantId), idempotencyKey);
+        } catch (DataIntegrityViolationException e) {
+            return idempotencyService.findPaymentId(merchantId, idempotencyKey)
+                    .map(paymentId -> paymentService.getById(paymentId, merchantId, false))
+                    .orElseThrow(() -> e);
         }
     }
 

@@ -1,5 +1,7 @@
 package com.transakt.transakt.payment;
 
+import com.transakt.transakt.common.IdempotencyKey;
+import com.transakt.transakt.common.IdempotencyKeyRepository;
 import com.transakt.transakt.common.ResourceNotFoundException;
 import com.transakt.transakt.ledger.EntryDirection;
 import com.transakt.transakt.ledger.LedgerEntry;
@@ -18,15 +20,18 @@ public class PaymentService {
 
     private final PaymentRepository paymentRepository;
     private final LedgerEntryRepository ledgerEntryRepository;
+    private final IdempotencyKeyRepository idempotencyKeyRepository;
 
     public PaymentService(PaymentRepository paymentRepository,
-                          LedgerEntryRepository ledgerEntryRepository) {
+                          LedgerEntryRepository ledgerEntryRepository,
+                          IdempotencyKeyRepository idempotencyKeyRepository) {
         this.paymentRepository = paymentRepository;
         this.ledgerEntryRepository = ledgerEntryRepository;
+        this.idempotencyKeyRepository = idempotencyKeyRepository;
     }
 
     @Transactional
-    public Payment create(Payment payment) {
+    public Payment create(Payment payment, String idempotencyKey) {
         payment.setId(UUID.randomUUID().toString());
         payment.setStatus(PaymentStatus.CAPTURED);
         payment.setCreatedAt(Instant.now());
@@ -49,6 +54,16 @@ public class PaymentService {
         debit.setAmountPaise(saved.getAmountPaise());
         debit.setCreatedAt(Instant.now());
         ledgerEntryRepository.save(debit);
+
+        if (idempotencyKey != null && !idempotencyKey.isBlank()) {
+            IdempotencyKey key = new IdempotencyKey();
+            key.setId(UUID.randomUUID().toString());
+            key.setMerchantId(saved.getMerchantId());
+            key.setIdempotencyKey(idempotencyKey);
+            key.setPaymentId(saved.getId());
+            key.setCreatedAt(Instant.now());
+            idempotencyKeyRepository.save(key);
+        }
 
         return saved;
     }
