@@ -1,6 +1,5 @@
 package com.transakt.transakt.payment;
 
-import com.transakt.transakt.common.IdempotencyConflictException;
 import com.transakt.transakt.common.IdempotencyService;
 import com.transakt.transakt.ledger.LedgerEntry;
 import jakarta.validation.Valid;
