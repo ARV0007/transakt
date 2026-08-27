@@ -927,3 +927,225 @@ charging someone twice."
 - The `catch (Exception e)` in `JwtAuthFilter` is wider than it needs to be. It should be
   `JwtException` — a `NullPointerException` in `extractRole` would currently deauthenticate silently
   rather than failing loudly.
+
+---
+
+## Day 17 — idempotency moves into the transaction (27 Aug 2026)
+
+**Commits:** `1d0914a` V5 migration · `4291a9a` entity and repository · `62213d7` the swap ·
+`3c725e3` dead code removed
+Also `5f83eb1` — narrowed the `JwtAuthFilter` catch, carried over from Day 16's open list.
+
+**Built**
+- **`V5__add_idempotency_keys.sql`** — five columns, a primary key, a foreign key to `payments`,
+  and the one that matters: `UNIQUE (merchant_id, idempotency_key)`.
+- **`IdempotencyKey` and `IdempotencyKeyRepository`** — one derived query,
+  `findByMerchantIdAndIdempotencyKey`.
+- **`PaymentService.create` now takes the idempotency key** and writes that row inside the same
+  `@Transactional` method as the payment and both ledger entries.
+- **`IdempotencyService` went from four methods to one.**
+
+**Verified with Redis stopped.** Same request twice, same `Idempotency-Key`:
+
+```
+{"id":"9173429d-...","createdAt":"2026-08-27T05:28:33.472017Z"}
+{"id":"9173429d-...","createdAt":"2026-08-27T05:28:33.472017Z"}
+```
+
+The identical `createdAt` is the proof — a second payment would carry a fresh `Instant.now()`.
+Hibernate logged an INSERT on the first and a SELECT on the second. `./mvnw test` → 20 green.
+
+---
+
+### Why
+
+Idempotency keys lived in Redis; payments live in Postgres. Two stores that fail independently, and
+the guarantee stretched across both. That produced two distinct failures, and I had only really
+noticed the first:
+
+**If Redis loses data, a retry creates a second payment.** A restart, an eviction, no persistence —
+the key vanishes and the next retry looks like a fresh request. **A double charge.**
+
+**If the app dies mid-request, the key is stuck.** `tryReserve` ran *before* `PaymentService.create`
+was entered; `storeResult` ran *after* it returned. So there was a window where the payment had
+committed but the key still said `IN_PROGRESS`. The merchant retries, gets a 409 for 24 hours, and
+can never retrieve the payment they were charged for. Reading `PaymentController` alongside
+`PaymentService` is what made this obvious — **the claim and the payment were never atomic, not even
+in principle.**
+
+### What replaced it
+
+Both rows now commit together or not at all. The interesting consequence is how much code that
+deletes:
+
+- **No `IN_PROGRESS`.** It existed only to say "I've claimed this but can't prove the outcome yet."
+  Inside one transaction there is no such moment.
+- **No `release()`.** It was the compensating action for a two-phase commit hand-rolled across two
+  databases. Rollback does it now.
+- **No 409.** A concurrent duplicate blocks at the database until the first commits, then receives the
+  original payment. `IdempotencyConflictException` and its handler were deleted — the state is
+  unreachable.
+
+Four methods became one. **When a design is right, code disappears rather than accumulating.**
+
+### Concepts
+
+- **A unique constraint is a coordination primitive.** The race isn't prevented — it's detected by
+  the database and recovered from. That's strictly better than a lock the application maintains,
+  because the database is already the thing that serialises writes.
+- **Catch the violation *outside* the transactional method.** Once a constraint fires, the transaction
+  is rollback-only; catching it inside means every subsequent query in that transaction fails too. The
+  controller is the right place — Spring has already rolled back cleanly and the re-read runs in a
+  fresh transaction.
+- **`orElseThrow(() -> e)` narrows without string-matching.** `DataIntegrityViolationException` covers
+  any constraint, not just ours — a null in a `NOT NULL` column throws the same type. Instead of
+  parsing constraint names out of the message, ask the database: *is the key there now?* If yes, we
+  lost a race, return the winner's payment. If no, it was a different violation entirely — rethrow.
+  Self-verifying.
+- **`paymentId` is a `String`, not a `@ManyToOne`.** This row is a receipt, not a node in an object
+  graph. A relationship mapping invites lazy loading of a whole `Payment` that nothing needs. The
+  foreign key still enforces the reference; the entity just doesn't pretend it's a navigation path.
+- **Tests written against the contract survive a rewrite of the implementation.** All five existing
+  idempotency tests passed unchanged while the entire storage layer was replaced underneath them.
+  That is the payoff for testing through HTTP instead of mocking the service — and the reason to keep
+  doing it.
+
+**Interview line**
+"Idempotency keys were in Redis and payments in Postgres, so the guarantee spanned two stores that
+fail independently — if Redis lost data, a retry became a double charge, and if the app died between
+the two writes, the key was stuck at IN_PROGRESS and the merchant could never retrieve the payment
+they'd been charged for. I moved the keys into Postgres with a unique constraint on
+`(merchant_id, idempotency_key)`, written inside the same transaction as the payment. The race is
+now detected by the database rather than prevented by my code: a concurrent duplicate blocks, gets a
+constraint violation, and I re-read and return the original payment. The IN_PROGRESS state, the
+release path and the 409 all stopped existing — four service methods became one."
+
+**Mistakes & fixes**
+1. **I assumed the idempotency calls were in `PaymentService`** and asked for the wrong file first.
+   They were in the controller — which turned out to be the whole point, since that placement was
+   what made the two writes non-atomic. **Reading both files together found a design flaw that
+   reading either alone would have missed.**
+2. **Redis left down again after the previous session's testing**, so the first `./mvnw test` failed
+   with seven `clearRedis` errors. Second time this week.
+3. **Ran `redis-server` in the working tab** and lost the shell. `Cmd+T` for a new one; renaming the
+   Redis tab would stop this recurring.
+
+**Still open**
+- **No TTL.** Redis expired keys after 24 hours for free; Postgres won't. Rows accumulate
+  indefinitely. A scheduled delete of rows older than 24 hours is the fix — until then this is a slow
+  leak, and it's in the known limitations for a reason.
+- **The race path is untested.** `IdempotencyIntegrationTest` is `@Transactional`, so a constraint
+  violation would poison the test's own transaction. The catch block in `PaymentController` is
+  therefore unexercised. Testing it properly needs two real concurrent requests against a committed
+  database — worth doing, not trivial.
+
+---
+
+## Day 17 — idempotency moves into the transaction (27 Aug 2026)
+
+**Commits:** `1d0914a` V5 migration · `4291a9a` entity and repository · `62213d7` the swap ·
+`3c725e3` dead code removed
+Also `5f83eb1` — narrowed the `JwtAuthFilter` catch, carried over from Day 16's open list.
+
+**Built**
+- **`V5__add_idempotency_keys.sql`** — five columns, a primary key, a foreign key to `payments`,
+  and the one that matters: `UNIQUE (merchant_id, idempotency_key)`.
+- **`IdempotencyKey` and `IdempotencyKeyRepository`** — one derived query,
+  `findByMerchantIdAndIdempotencyKey`.
+- **`PaymentService.create` now takes the idempotency key** and writes that row inside the same
+  `@Transactional` method as the payment and both ledger entries.
+- **`IdempotencyService` went from four methods to one.**
+
+**Verified with Redis stopped.** Same request twice, same `Idempotency-Key`:
+
+```
+{"id":"9173429d-...","createdAt":"2026-08-27T05:28:33.472017Z"}
+{"id":"9173429d-...","createdAt":"2026-08-27T05:28:33.472017Z"}
+```
+
+The identical `createdAt` is the proof — a second payment would carry a fresh `Instant.now()`.
+Hibernate logged an INSERT on the first and a SELECT on the second. `./mvnw test` → 20 green.
+
+---
+
+### Why
+
+Idempotency keys lived in Redis; payments live in Postgres. Two stores that fail independently, and
+the guarantee stretched across both. That produced two distinct failures, and I had only really
+noticed the first:
+
+**If Redis loses data, a retry creates a second payment.** A restart, an eviction, no persistence —
+the key vanishes and the next retry looks like a fresh request. **A double charge.**
+
+**If the app dies mid-request, the key is stuck.** `tryReserve` ran *before* `PaymentService.create`
+was entered; `storeResult` ran *after* it returned. So there was a window where the payment had
+committed but the key still said `IN_PROGRESS`. The merchant retries, gets a 409 for 24 hours, and
+can never retrieve the payment they were charged for. Reading `PaymentController` alongside
+`PaymentService` is what made this obvious — **the claim and the payment were never atomic, not even
+in principle.**
+
+### What replaced it
+
+Both rows now commit together or not at all. The interesting consequence is how much code that
+deletes:
+
+- **No `IN_PROGRESS`.** It existed only to say "I've claimed this but can't prove the outcome yet."
+  Inside one transaction there is no such moment.
+- **No `release()`.** It was the compensating action for a two-phase commit hand-rolled across two
+  databases. Rollback does it now.
+- **No 409.** A concurrent duplicate blocks at the database until the first commits, then receives the
+  original payment. `IdempotencyConflictException` and its handler were deleted — the state is
+  unreachable.
+
+Four methods became one. **When a design is right, code disappears rather than accumulating.**
+
+### Concepts
+
+- **A unique constraint is a coordination primitive.** The race isn't prevented — it's detected by
+  the database and recovered from. That's strictly better than a lock the application maintains,
+  because the database is already the thing that serialises writes.
+- **Catch the violation *outside* the transactional method.** Once a constraint fires, the transaction
+  is rollback-only; catching it inside means every subsequent query in that transaction fails too. The
+  controller is the right place — Spring has already rolled back cleanly and the re-read runs in a
+  fresh transaction.
+- **`orElseThrow(() -> e)` narrows without string-matching.** `DataIntegrityViolationException` covers
+  any constraint, not just ours — a null in a `NOT NULL` column throws the same type. Instead of
+  parsing constraint names out of the message, ask the database: *is the key there now?* If yes, we
+  lost a race, return the winner's payment. If no, it was a different violation entirely — rethrow.
+  Self-verifying.
+- **`paymentId` is a `String`, not a `@ManyToOne`.** This row is a receipt, not a node in an object
+  graph. A relationship mapping invites lazy loading of a whole `Payment` that nothing needs. The
+  foreign key still enforces the reference; the entity just doesn't pretend it's a navigation path.
+- **Tests written against the contract survive a rewrite of the implementation.** All five existing
+  idempotency tests passed unchanged while the entire storage layer was replaced underneath them.
+  That is the payoff for testing through HTTP instead of mocking the service — and the reason to keep
+  doing it.
+
+**Interview line**
+"Idempotency keys were in Redis and payments in Postgres, so the guarantee spanned two stores that
+fail independently — if Redis lost data, a retry became a double charge, and if the app died between
+the two writes, the key was stuck at IN_PROGRESS and the merchant could never retrieve the payment
+they'd been charged for. I moved the keys into Postgres with a unique constraint on
+`(merchant_id, idempotency_key)`, written inside the same transaction as the payment. The race is
+now detected by the database rather than prevented by my code: a concurrent duplicate blocks, gets a
+constraint violation, and I re-read and return the original payment. The IN_PROGRESS state, the
+release path and the 409 all stopped existing — four service methods became one."
+
+**Mistakes & fixes**
+1. **I assumed the idempotency calls were in `PaymentService`** and asked for the wrong file first.
+   They were in the controller — which turned out to be the whole point, since that placement was
+   what made the two writes non-atomic. **Reading both files together found a design flaw that
+   reading either alone would have missed.**
+2. **Redis left down again after the previous session's testing**, so the first `./mvnw test` failed
+   with seven `clearRedis` errors. Second time this week.
+3. **Ran `redis-server` in the working tab** and lost the shell. `Cmd+T` for a new one; renaming the
+   Redis tab would stop this recurring.
+
+**Still open**
+- **No TTL.** Redis expired keys after 24 hours for free; Postgres won't. Rows accumulate
+  indefinitely. A scheduled delete of rows older than 24 hours is the fix — until then this is a slow
+  leak, and it's in the known limitations for a reason.
+- **The race path is untested.** `IdempotencyIntegrationTest` is `@Transactional`, so a constraint
+  violation would poison the test's own transaction. The catch block in `PaymentController` is
+  therefore unexercised. Testing it properly needs two real concurrent requests against a committed
+  database — worth doing, not trivial.
