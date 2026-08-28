@@ -31,29 +31,11 @@ public class PaymentService {
     }
 
     @Transactional
-    public Payment create(Payment payment, String idempotencyKey) {
+    public Payment createPending(Payment payment, String idempotencyKey) {
         payment.setId(UUID.randomUUID().toString());
-        payment.setStatus(PaymentStatus.CAPTURED);
+        payment.setStatus(PaymentStatus.PENDING);
         payment.setCreatedAt(Instant.now());
         Payment saved = paymentRepository.save(payment);
-
-        LedgerEntry credit = new LedgerEntry();
-        credit.setId(UUID.randomUUID().toString());
-        credit.setPaymentId(saved.getId());
-        credit.setAccount("merchant:" + saved.getMerchantId());
-        credit.setDirection(EntryDirection.CREDIT);
-        credit.setAmountPaise(saved.getAmountPaise());
-        credit.setCreatedAt(Instant.now());
-        ledgerEntryRepository.save(credit);
-
-        LedgerEntry debit = new LedgerEntry();
-        debit.setId(UUID.randomUUID().toString());
-        debit.setPaymentId(saved.getId());
-        debit.setAccount("gateway:incoming");
-        debit.setDirection(EntryDirection.DEBIT);
-        debit.setAmountPaise(saved.getAmountPaise());
-        debit.setCreatedAt(Instant.now());
-        ledgerEntryRepository.save(debit);
 
         if (idempotencyKey != null && !idempotencyKey.isBlank()) {
             IdempotencyKey key = new IdempotencyKey();
@@ -66,6 +48,40 @@ public class PaymentService {
         }
 
         return saved;
+    }
+
+    @Transactional
+    public Payment settle(String paymentId, boolean approved) {
+        Payment payment = paymentRepository.findById(paymentId)
+                .orElseThrow(() -> new ResourceNotFoundException("Payment not found: " + paymentId));
+
+        if (!approved) {
+            payment.setStatus(PaymentStatus.FAILED);
+            return paymentRepository.save(payment);
+        }
+
+        payment.setStatus(PaymentStatus.CAPTURED);
+        Payment captured = paymentRepository.save(payment);
+
+        LedgerEntry credit = new LedgerEntry();
+        credit.setId(UUID.randomUUID().toString());
+        credit.setPaymentId(captured.getId());
+        credit.setAccount("merchant:" + captured.getMerchantId());
+        credit.setDirection(EntryDirection.CREDIT);
+        credit.setAmountPaise(captured.getAmountPaise());
+        credit.setCreatedAt(Instant.now());
+        ledgerEntryRepository.save(credit);
+
+        LedgerEntry debit = new LedgerEntry();
+        debit.setId(UUID.randomUUID().toString());
+        debit.setPaymentId(captured.getId());
+        debit.setAccount("gateway:incoming");
+        debit.setDirection(EntryDirection.DEBIT);
+        debit.setAmountPaise(captured.getAmountPaise());
+        debit.setCreatedAt(Instant.now());
+        ledgerEntryRepository.save(debit);
+
+        return captured;
     }
 
     public Page<Payment> getAllForCaller(String callerMerchantId, boolean isAdmin, Pageable pageable) {

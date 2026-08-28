@@ -19,11 +19,14 @@ public class PaymentController {
 
     private final PaymentService paymentService;
     private final IdempotencyService idempotencyService;
+    private final PaymentProcessor paymentProcessor;
 
     public PaymentController(PaymentService paymentService,
-                             IdempotencyService idempotencyService) {
+                             IdempotencyService idempotencyService,
+                             PaymentProcessor paymentProcessor) {
         this.paymentService = paymentService;
         this.idempotencyService = idempotencyService;
+        this.paymentProcessor = paymentProcessor;
     }
 
     @PostMapping
@@ -34,7 +37,7 @@ public class PaymentController {
         String merchantId = authentication.getName();
 
         if (idempotencyKey == null || idempotencyKey.isBlank()) {
-            return paymentService.create(buildPayment(request, merchantId), null);
+            return paymentProcessor.process(buildPayment(request, merchantId), null);
         }
 
         Optional<String> existing = idempotencyService.findPaymentId(merchantId, idempotencyKey);
@@ -43,7 +46,7 @@ public class PaymentController {
         }
 
         try {
-            return paymentService.create(buildPayment(request, merchantId), idempotencyKey);
+            return paymentProcessor.process(buildPayment(request, merchantId), idempotencyKey);
         } catch (DataIntegrityViolationException e) {
             return idempotencyService.findPaymentId(merchantId, idempotencyKey)
                     .map(paymentId -> paymentService.getById(paymentId, merchantId, false))
