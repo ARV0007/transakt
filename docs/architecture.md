@@ -1,12 +1,12 @@
 # Transakt Architecture
 
-## Current: v1.4 — idempotency in the database (Days 13–17)
+## Current: v1.5 — the bank seam (Days 13–18)
 
 **Live at https://transakt.onrender.com**
 
 ### Deployment topology
 
-```mermaid
+````mermaid
 flowchart TD
   client[Merchant server or dashboard]
   client -->|HTTPS| edge[Render edge - Cloudflare - TLS terminates here]
@@ -14,17 +14,17 @@ flowchart TD
   app -->|private network - no TLS needed| pg[(transakt-db - PostgreSQL 18 - Singapore)]
   app -->|private network - no TLS needed| kv[(transakt-redis - Valkey 8 - Singapore)]
   gh[GitHub ARV0007/transakt - branch main] -->|Auto-Deploy on push| build[Render build - multi-stage Dockerfile]
-  gh -->|push or pull request| ci[GitHub Actions - twenty tests against service containers]
+  gh -->|push or pull request| ci[GitHub Actions - twenty-two tests against service containers]
   build --> app
   flyway[Flyway V1-V5 - runs at container startup, before Hibernate validates] -.-> pg
-```
+````
 
 All three services sit in the same region because Render's private networking is per-region — an
 internal hostname resolves only from inside it. The public internet reaches exactly one of them.
 
 ### Application internals
 
-```mermaid
+````mermaid
 flowchart TD
   server[Merchant server - a machine]
   human[Merchant dashboard - a human]
@@ -45,26 +45,61 @@ flowchart TD
   dispatcher -.->|exceptions| geh[GlobalExceptionHandler - 400 401 404]
   tomcat -.->|unhandled 500 forwarded| err[/error - permitAll, or its own denial masks the real status/]
   pc --> idem[IdempotencyService - one lookup by merchant plus key]
+  pc -->|writes| proc[PaymentProcessor - runs the three steps, holds no transaction of its own]
+  pc -->|reads| ps[PaymentService - ownership checks, scoped queries]
+  proc -->|transaction 1| pend[PaymentService.createPending - payment row as PENDING plus the idempotency key]
+  proc -->|NO transaction held - 200 to 800ms| bank[BankClient - the port]
+  bank --> fake[FakeBankClient - configurable latency and decline rate]
+  proc -->|transaction 2| settle[PaymentService.settle - final status, ledger entries only when approved]
   rlf --> rate[RateLimitService - INCR plus TTL]
   rate --> redis[(Redis or Valkey - rate counters only)]
   ac --> as[AuthService]
   as --> js[JwtService]
   as --> pe[PasswordEncoder - BCrypt]
   mc --> ms[MerchantService]
-  pc --> ps[PaymentService - ownership checks plus Transactional writes]
   ms --> mr[MerchantRepository]
   ps --> pr[PaymentRepository - findByMerchantId returns a Page]
-  ps --> lr[LedgerEntryRepository]
-  ps --> ikr[IdempotencyKeyRepository - written inside the payment transaction]
+  pend --> pr
+  pend --> ikr[IdempotencyKeyRepository - written inside transaction 1]
+  settle --> pr
+  settle --> lr[LedgerEntryRepository - two balancing rows, approved only]
   idem --> ikr
   mr --> db[(PostgreSQL)]
   pr --> db
   lr --> db
   ikr --> db
   flyway[Flyway V1-V5 - runs once at startup, before Hibernate validates] -.-> db
-```
+````
 
-**How a request flows:** Tomcat parses the HTTP request. Three filters run before any controller. `JwtAuthFilter` looks for an `Authorization: Bearer` header and, if the signature verifies and the token has not expired, records the caller's merchant ID and role in the SecurityContext with no database access. `ApiKeyFilter` then looks for `X-API-Key` and, if the context is still empty, takes the key's first eight characters as a lookup prefix, finds the single matching merchant row through a unique index, and compares the SHA-256 of the whole key against the stored hash before recording the same identity. `RateLimitFilter` runs last of the three — deliberately, because it needs an identity to count against — and refuses the request outright with 429 if that merchant has exceeded its per-minute allowance. The DispatcherServlet then routes to a controller. Controllers read the caller's identity from the SecurityContext and hand services plain values, so services stay free of Spring Security types. `PaymentService` is `@Transactional` on writes: a payment, its two balancing ledger entries, and its idempotency key all commit together or not at all.
+**How a request flows:** Tomcat parses the HTTP request. Three filters run before any controller. `JwtAuthFilter` looks for an `Authorization: Bearer` header and, if the signature verifies and the token has not expired, records the caller's merchant ID and role in the SecurityContext with no database access. `ApiKeyFilter` then looks for `X-API-Key` and, if the context is still empty, takes the key's first eight characters as a lookup prefix, finds the single matching merchant row through a unique index, and compares the SHA-256 of the whole key against the stored hash before recording the same identity. `RateLimitFilter` runs last of the three — deliberately, because it needs an identity to count against — and refuses the request outright with 429 if that merchant has exceeded its per-minute allowance. The DispatcherServlet then routes to a controller. Controllers read the caller's identity from the SecurityContext and hand services plain values, so services stay free of Spring Security types. Creating a payment is no longer one transaction: `PaymentProcessor` opens one to record the attempt, closes it, calls the bank, then opens a second to record the outcome. Each half is still atomic — the payment row and its idempotency key together, then the final status and both ledger entries together — but the two halves are not atomic with each other, and that is deliberate.
+
+**The bank seam, and why one transaction became two (v1.5):** payments now go through an acquiring bank. `BankClient` is an interface; `FakeBankClient` implements it with a configurable latency between two hundred and eight hundred milliseconds and a configurable decline rate. Nothing above the interface knows that today's implementation flips a weighted coin, which is the whole reason for putting it there — a real acquirer is a second adapter behind the same port rather than a rewrite of the payment path.
+
+The interesting consequence is not the bank call but where it had to go. `PaymentService.create` was a single `@Transactional` method, and a `@Transactional` method holds a pooled database connection from entry until commit. Putting an eight-hundred-millisecond call to a third party inside it makes connection hold time *database work plus somebody else's network*, where the second term dominates and is entirely outside this system's control. The pool is small on purpose. Under concurrency every in-flight payment occupies a connection while waiting on a remote server, the pool drains, and requests that never touch payments start failing on connection acquisition. **A slow bank becomes an unavailable database, and the outage surfaces on endpoints that have nothing to do with banks.**
+
+So `create` was split. `createPending` opens a transaction, writes the payment row as `PENDING` along with its idempotency key, and commits. The bank call then happens with **no transaction open and no connection held**. `settle` opens a second transaction and records the outcome. `PaymentProcessor` runs the three steps in order.
+
+That processor is a separate bean rather than a third method on `PaymentService`, and the reason is mechanical rather than stylistic. Spring implements `@Transactional` with a proxy wrapping the bean; a call from inside the same object reaches the object directly and never passes through the proxy, so the annotation does nothing and nothing warns you. **Self-invocation defeats proxy-based annotations, silently** — the same trap that pushed the Day 10 idempotency orchestration up into the controller.
+
+**Ledger entries belong to the approved branch (v1.5).** They are written inside `settle`, only when the bank approves. Before Day 18 a payment appended its CREDIT and DEBIT pair as part of being created, which was harmless while every payment succeeded by construction and wrong the moment one could fail. A ledger row asserts that money moved. A declined payment moved nothing, so it writes nothing, and its ledger is legitimately empty.
+
+**Payment status is a state machine now (v1.5):**
+
+````mermaid
+stateDiagram-v2
+  [*] --> PENDING: createPending - transaction 1
+  PENDING --> CAPTURED: settle - bank approved - two ledger entries written
+  PENDING --> DECLINED: settle - bank declined - no ledger entries
+  note right of PENDING
+    A process that dies between the two
+    transactions strands a payment here.
+    Nothing sweeps these up.
+  end note
+````
+
+**What the split costs.** Atomicity was doing real work and now it is not. One transaction meant a payment either fully existed or fully did not. Two means there is an observable state in between: a row at `PENDING` with no outcome recorded. That gap cannot be closed by rearranging code. It is the price of not blocking, and every real payment system pays it. The standard answer is a reconciliation job that sweeps `PENDING` rows past some age, asks the bank what actually happened, and settles them. **This one does not have one.**
+
+It is also the first honest motivation for Kafka this project has had. Once the outcome legitimately arrives separately from the request, publishing an event and letting a consumer drive settlement stops being a resume line and becomes the obvious shape of the problem.
 
 **One artifact, three environments (v1.3):** every external address in `application.yaml` is now `${VAR:sensible-default}` — database host, name, user and password; Redis host, port and password; the HTTP port; the JWT secret; the rate limit. The same jar and the same image run on a MacBook, inside docker-compose, and in Singapore. Only the environment differs.
 
@@ -108,11 +143,13 @@ SHA-256 rather than BCrypt is deliberate. Slow hashing defends against guessable
 
 The migration was performed as **expand and contract** across four steps: add the columns nullable and backfill them, start writing them on every signup, switch the reader, then enforce `NOT NULL` and drop the old column. Between the first and last step the database supported both shapes, so no intermediate state could lose data, and the only irreversible step was last and isolated. Two orderings inside that sequence are easy to get backwards and both matter: writers must switch before readers, or a merchant created in between has a key but no hash; and `NOT NULL` belongs to the contract phase, because during expand the entity does not yet map the columns and every insert would write null.
 
-**The test suite (v1.1, twenty tests since v1.4):** nineteen integration tests across four classes plus one unit test, running against the full stack in about twenty seconds. `AuthIntegrationTest` covers signup, login and both failure paths. `OwnershipIntegrationTest` covers foreign payments and ledgers returning 404, list scoping, and the forged `merchantId` being ignored. `IdempotencyIntegrationTest` covers key reuse, key scoping per merchant, and the deliberate decision not to fingerprint the request body. `RateLimitIntegrationTest` covers the 429 threshold and the fact that one merchant hitting the ceiling does not affect another. All use `MockMvc`, which sends real requests through the entire filter chain and into a real database without opening a network port.
+**The test suite (v1.1, twenty-two tests since v1.5):** twenty-one integration tests plus one unit test, running against the full stack in about twenty seconds. `AuthIntegrationTest` covers signup, login and both failure paths. `OwnershipIntegrationTest` covers foreign payments and ledgers returning 404, list scoping, and the forged `merchantId` being ignored. `IdempotencyIntegrationTest` covers key reuse, key scoping per merchant, and the deliberate decision not to fingerprint the request body. `RateLimitIntegrationTest` covers the 429 threshold and the fact that one merchant hitting the ceiling does not affect another. All use `MockMvc`, which sends real requests through the entire filter chain and into a real database without opening a network port.
 
 All five idempotency tests passed **unchanged** through the v1.4 rewrite, while the entire storage layer beneath them was replaced. That is the payoff for testing through the front door rather than mocking the service: the tests describe the contract, so they survive any implementation that still honours it.
 
 `RateLimitServiceTest` is the exception that proves the rule — the project's only unit test, and correct precisely because the behaviour it covers is a single catch block. Exercising it requires Redis to fail *on demand*, which a mocked `StringRedisTemplate` does cleanly and a real one does not. Test at the level where the behaviour actually lives.
+
+Day 18 added two tests pinning the payment state machine: an approved payment ends `CAPTURED` with two balancing ledger entries, a declined one ends `DECLINED` with none. Both set `FakeBankClient`'s decline rate explicitly — zero or one hundred — rather than letting it randomise. **A random decline rate is a feature by hand and a defect in CI.** Exploring manually, it shows you both branches without touching config. In a pipeline it makes a red build mean nothing, and a test that flips a coin trains you to re-run CI instead of reading it.
 
 **Why integration rather than unit tests (v1.1):** almost everything interesting in this system lives in the wiring — a three-filter chain, first-match-wins path rules, ownership checks that depend on who authenticated, idempotency and rate limiting that depend on external stores. A unit test of `PaymentService` with mocked repositories would pass happily while `SecurityConfig` was wide open, because it never touches a filter. Testing through the front door is what makes the security model verifiable at all. The tests worth having are the ones guarding failures that would be **silent** in production: removing `@JsonProperty(WRITE_ONLY)` from the password field, changing one login error message and reopening email enumeration, adding `merchantId` back to the request DTO, or dropping the merchant ID out of an idempotency or rate-limit key. Each is a one-word change that looks harmless in a diff.
 
@@ -124,7 +161,7 @@ The clearest evidence arrived on Day 12. Making `apiKey` transient caused signup
 
 That division moved in v1.4. Idempotency keys previously lived in Redis on the reasoning that they mattered intensely for 24 hours and then never again, with the durability trade accepted knowingly — the v1.0 note said outright that systems which cannot tolerate a lost key store it in the database under a unique index and pay the latency. This is now one of those systems, because the tolerance was smaller than it looked: a lost key does not merely weaken a guarantee, it double-charges a customer.
 
-**Idempotency is a unique constraint, not a lock (v1.4):** `POST /api/v1/payments` accepts an optional `Idempotency-Key` header. The controller looks the key up in `idempotency_keys` first, and a hit returns the original payment. A miss creates the payment, both ledger entries and the key row **in a single transaction**, guarded by `UNIQUE (merchant_id, idempotency_key)`. A retry carrying the same key gets the original payment back — same id, same `createdAt` — rather than creating a second one.
+**Idempotency is a unique constraint, not a lock (v1.4):** `POST /api/v1/payments` accepts an optional `Idempotency-Key` header. The controller looks the key up in `idempotency_keys` first, and a hit returns the original payment. A miss creates the payment row and the key row together **in a single transaction** — `createPending`, since v1.5 — guarded by `UNIQUE (merchant_id, idempotency_key)`. The ledger entries follow in the second transaction, and only on approval. A retry carrying the same key gets the original payment back — same id, same `createdAt` — rather than creating a second one.
 
 Two simultaneous requests race at the database rather than in application code: the second blocks on the constraint until the first commits, then fails with `DataIntegrityViolationException`. The controller catches that, re-reads the key, and returns the winner's payment. **The race is detected and recovered from rather than prevented**, which is strictly better than a lock the application maintains, because the database is already the thing that serialises writes. Keys stay scoped by merchant because clients choose their own key strings and two merchants could independently pick the same one.
 
@@ -132,7 +169,7 @@ The design this replaced reserved the key as `IN_PROGRESS` before the payment ex
 
 The state machine disappeared with them. There is no `IN_PROGRESS`, because inside one transaction there is no moment where a claim exists without a payment. There is no `release()`, because that was the compensating action for a two-phase commit hand-rolled across two databases, and rollback does it now. There is no **409 Conflict**, because a concurrent duplicate no longer errors — it blocks, then receives the original payment, which is better behaviour than the code it replaced. `IdempotencyConflictException` and its handler were deleted as unreachable. Four service methods became one.
 
-**The lookup lives in the controller, the write lives in the service (v1.4):** the key lookup and the constraint-violation recovery are HTTP concerns and stay in `PaymentController`; the key row itself is written inside `PaymentService.create`, which is where the transaction is. The catch *must* be outside that method — once a constraint fires the transaction is marked rollback-only, so catching it inside would poison every subsequent query. Catching in the controller means Spring has already rolled back cleanly and the re-read runs in a fresh transaction.
+**The lookup lives in the controller, the write lives in the service (v1.4):** the key lookup and the constraint-violation recovery are HTTP concerns and stay in `PaymentController`; the key row itself is written inside `PaymentService.createPending`, which since v1.5 is where the first transaction is. The catch *must* be outside that method — once a constraint fires the transaction is marked rollback-only, so catching it inside would poison every subsequent query. Catching in the controller means Spring has already rolled back cleanly and the re-read runs in a fresh transaction.
 
 Narrowing that catch without string-matching is worth noting: `DataIntegrityViolationException` covers any constraint violation, not only this one. Rather than parsing constraint names out of the message, the handler asks the database whether the key is present now. If it is, we lost a race — return the winner's payment. If it is not, it was a different violation entirely, and the original exception is rethrown.
 
@@ -154,10 +191,11 @@ Idempotency takes the opposite answer for the opposite reason, and the asymmetry
 
 **Validation and error handling (v0.6):** clients send DTOs exposing only the fields they may set. Bean Validation enforces rules such as "amount must be positive". A single `GlobalExceptionHandler` turns every exception into consistent JSON with the right status code — 400 validation, 401 bad credentials, 404 missing or inaccessible — so stack traces never leak. The 409 idempotency conflict handler was removed in v1.4; that state is now unreachable.
 
-**The double-entry ledger (v0.5):** a payment never updates a stored balance. It appends two `LedgerEntry` rows — a CREDIT to the merchant account and an equal DEBIT from the gateway account. They are equal and opposite, so the books always net to zero and corruption is detectable. Entries are append-only. Money is integer paise, never a decimal.
+**The double-entry ledger (v0.5):** a payment never updates a stored balance. It appends two `LedgerEntry` rows — a CREDIT to the merchant account and an equal DEBIT from the gateway account. They are equal and opposite, so the books always net to zero and corruption is detectable. Entries are append-only. Money is integer paise, never a decimal. Since v1.5 those rows are appended inside `settle` and only when the bank approves, so a declined payment has no ledger entries at all.
 
 **Known limitations:**
 
+- **A payment can be stranded at `PENDING`.** Creation and settlement are separate transactions with a bank call in between, so a process that dies in the gap leaves a payment with no recorded outcome and nothing to resolve it. Worse, the idempotency key is written in the first transaction, so a retry carrying the same key returns the stranded payment rather than starting a fresh attempt — the mechanism that prevents double charges also prevents recovery. A scheduled reconciliation job is the fix and does not exist.
 - **Idempotency keys never expire.** Redis expired them after 24 hours for free; Postgres has no TTL. Rows accumulate indefinitely, growing the table and its unique index without bound. A scheduled delete of rows older than 24 hours is the fix — until then this is a slow leak, traded knowingly for durability.
 - **The idempotency race path is untested.** `IdempotencyIntegrationTest` is `@Transactional`, so a constraint violation would poison the test's own transaction and the recovery block never runs. It does not fire in practice either, because the lookup catches duplicates before any insert is attempted. Exercising it needs two genuinely concurrent requests against a committed database.
 - **The free web service spins down after fifteen minutes idle.** A measured cold start exceeded two minutes. Any shared link needs that caveat.
@@ -190,4 +228,10 @@ Idempotency takes the opposite answer for the opposite reason, and the asymmetry
 | v1.1 | 11 | Integration test suite — nineteen tests across auth, ownership, idempotency and rate limiting. |
 | v1.2 | 12 | Flyway migrations replace ddl-auto; paginated payment listing; API keys stored as a lookup prefix plus SHA-256 hash. |
 | v1.3 | 13–14 | Multi-stage Docker image and docker-compose; every external address parameterised; deployed to Render with managed PostgreSQL and Valkey, live over HTTPS. |
-| **v1.4** | **15–17** | **CI on every push; `/error` permitted so failures report their real status; rate limiter fails open by design; idempotency keys moved into Postgres under a unique constraint, written inside the payment transaction.** |
+| v1.4 | 15–17 | CI on every push; `/error` permitted so failures report their real status; rate limiter fails open by design; idempotency keys moved into Postgres under a unique constraint, written inside the payment transaction. |
+| **v1.5** | **18** | **A `BankClient` port with a fake adapter; payment creation split into two transactions with the bank call in the gap; ledger entries written only on approval; `PENDING` becomes a real state.** |
+````
+
+Same four things to verify against the code before committing: the `CAPTURED` / `DECLINED` enum names, whether Day 18 added a V6 migration (if so, both diagrams need `V1-V6`), the class name holding the two new tests, and whether `settle` re-reads the payment or takes the object through.
+
+Then `git diff --stat` — expect well over a hundred lines changed on this file. If it says one or two, the paste didn't land.

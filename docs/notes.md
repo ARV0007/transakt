@@ -1633,3 +1633,57 @@ separately from it.
 **Same infrastructure, same failure, opposite correct answers.** The deciding question is not "how do I
 handle the error" but "what is the worst thing that happens if this control silently stops working" —
 and for these two features, those answers are nothing alike.
+
+## Why a slow call must never sit inside a transaction
+
+### The restaurant version
+
+The fridge is PostgreSQL. There are only so many keys to it, and the kitchen
+shares them — that set of keys is the connection pool.
+
+The chef needs to phone an outside supplier before finishing an order. The wrong
+way: take a fridge key, phone the supplier, stand there on hold for ten minutes,
+and only then open the fridge. The key is in the chef's pocket the whole time.
+Nobody else can get into the fridge. It doesn't matter that the fridge is fine
+and nobody is using it. The key is gone.
+
+Multiply that by every order arriving at once, and the kitchen stops. Not because
+the fridge failed, but because every key is in somebody's pocket, out on a phone
+call.
+
+The right way: take a key, write the order slip, hand the key back. Go make the
+call. Come back, take a key again, record the outcome. The phone call takes just
+as long, but the fridge stays available throughout.
+
+### The technical version
+
+A `@Transactional` method holds a database connection from the moment it starts
+until it commits or rolls back. HikariCP hands out a fixed number of these. The
+number is small on purpose, because each one costs the database memory and a
+backend process.
+
+If an HTTP call to a bank lives inside that method, connection hold time becomes
+`database work + network round trip`, where the second term is orders of
+magnitude larger and entirely outside your control. The bank being slow becomes
+your database being unavailable. The failure spreads to endpoints that never
+touch payments, which makes it genuinely confusing to diagnose.
+
+So: split the work. Commit what you know. Make the call with no connection held.
+Open a second transaction to record what came back.
+
+### What splitting costs you
+
+Atomicity was doing real work before, and now it isn't. One transaction meant the
+payment either fully existed or fully didn't. Two transactions means there is an
+observable middle: a row sitting at PENDING with no outcome recorded.
+
+That gap is not a bug you can close by rearranging the code. It's the price of
+not blocking, and every real payment system pays it. The standard answer is a
+reconciliation job: a scheduled sweep that finds payments stuck at PENDING past
+some age, asks the bank what actually happened, and settles them. Transakt does
+not have one yet.
+
+This is also the honest motivation for Kafka. Once you accept that the outcome
+arrives separately from the request, publishing an event and letting a consumer
+handle settlement stops being architecture cosplay and starts being the obvious
+shape of the problem.

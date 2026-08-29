@@ -1149,3 +1149,83 @@ release path and the 409 all stopped existing — four service methods became on
   violation would poison the test's own transaction. The catch block in `PaymentController` is
   therefore unexercised. Testing it properly needs two real concurrent requests against a committed
   database — worth doing, not trivial.
+
+## Day 18 — the bank seam (28 Aug 2026)
+
+**Built**
+- `BankClient` interface, plus `FakeBankClient` implementing it with a configurable
+  latency (200–800ms) and a configurable decline rate.
+- `PaymentService.create` split into two transactional methods: `createPending`
+  (writes the payment row as PENDING, plus the idempotency key) and `settle`
+  (sets the final status and writes ledger entries if approved).
+- A new `PaymentProcessor` that orchestrates the three steps.
+- Ledger entries moved inside the approved branch. A declined payment now writes
+  no ledger rows at all.
+- Two new tests pinning the state machine. 22 tests green.
+
+The shape:
+
+```
+createPending()    ← transaction 1: payment row + idempotency key
+bank.authorize()   ← NO transaction. 200–800ms.
+settle()           ← transaction 2: final status + ledger entries
+```
+
+**Why**
+
+Two reasons, and the second is the real one.
+
+1. A payment gateway that never talks to a bank isn't a payment gateway.
+   `BankClient` is the seam where a real acquirer would plug in. Nothing above it
+   knows that today's implementation flips a weighted coin.
+
+2. The bank call takes up to 800ms. If it sat inside a single `@Transactional`
+   method, a pooled database connection would be held open and idle for that
+   entire round trip. The pool has a fixed size. Under load, every in-flight
+   payment squats on a connection while waiting on someone else's server, the
+   pool empties, and endpoints with nothing to do with payments start failing on
+   connection acquisition. So the transaction is split, with the slow call in
+   the gap.
+
+**Concepts**
+- *Transaction boundary vs request boundary.* They are separate things and do not
+  have to line up. One HTTP request here spans two transactions.
+- *A transaction should contain database work and nothing else.* Anything remote,
+  slow, or capable of hanging belongs outside it.
+- *Ports and adapters.* `BankClient` is the port. `FakeBankClient` is one adapter;
+  a real acquirer client would be another. Swapping it is a config change.
+- *Self-invocation and the proxy, again.* Both new methods carry `@Transactional`,
+  which Spring implements by wrapping the bean in a proxy. Had `PaymentService`
+  called its own `settle`, the call would hit the object directly, skip the proxy,
+  and run with no transaction at all — silently. `PaymentProcessor` existing as a
+  separate bean is what makes those annotations do anything. Same reason the
+  Day 10 idempotency orchestration was pushed up into the controller.
+- *Declines are not movements.* Double-entry means every ledger row records money
+  that actually moved. A declined payment moved nothing, so it writes nothing.
+  Before this, the ledger was recording intent rather than fact.
+- *Failure now has a shape.* Two transactions means there is a real state between
+  them. A crash after `createPending` and before `settle` strands a payment at
+  PENDING. Nothing sweeps those up yet.
+
+**Interview line**
+
+"The bank call takes up to 800ms, so I split payment creation into two
+transactions with the external call in the gap between them. Holding a pooled
+database connection open while you wait on a third party is how you drain the
+pool and take down endpoints that have nothing to do with payments."
+
+**Mistake & fix**
+
+`FakeBankClient` declines a configurable percentage of payments at random. That is
+exactly right for poking at it by hand: you see both branches without editing
+anything. It is poison in CI. A test that passes or fails on a coin flip teaches
+you nothing and trains you to re-run the pipeline instead of reading it. Fix: the
+tests set the decline rate explicitly, 0 or 100, so each test drives one branch
+deterministically. Randomness is a manual-exploration feature, never a test
+feature.
+
+**Still open**
+- A payment stranded at PENDING if the process dies between the two transactions.
+  No reconciliation job exists.
+- Idempotency keys have no TTL and accumulate forever.
+- The idempotency race path is untested.

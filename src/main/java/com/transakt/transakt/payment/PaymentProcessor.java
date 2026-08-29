@@ -3,7 +3,9 @@ package com.transakt.transakt.payment;
 import com.transakt.transakt.bank.BankClient;
 import com.transakt.transakt.bank.BankResult;
 import org.springframework.stereotype.Component;
+import lombok.extern.slf4j.Slf4j;
 
+@Slf4j
 @Component
 public class PaymentProcessor {
 
@@ -18,9 +20,15 @@ public class PaymentProcessor {
     public Payment process(Payment payment, String idempotencyKey) {
         Payment pending = paymentService.createPending(payment, idempotencyKey);
 
-        BankResult result = bankClient.authorize(
-                pending.getId(), pending.getAmountPaise(), pending.getCurrency());
-
+        BankResult result;
+        try {
+            result = bankClient.authorize(
+                    pending.getId(), pending.getAmountPaise(), pending.getCurrency());
+        } catch (RuntimeException e) {
+            log.warn("Bank call failed for payment {} — leaving PENDING for reconciliation",
+                    pending.getId(), e);
+            return pending;
+        }
         return paymentService.settle(pending.getId(), result == BankResult.APPROVED);
     }
 }
