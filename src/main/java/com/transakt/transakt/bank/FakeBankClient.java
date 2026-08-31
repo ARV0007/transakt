@@ -42,6 +42,14 @@ public class FakeBankClient implements BankClient {
     public BankResult lookup(String paymentId) {
         return decisions.get(paymentId);
     }
+    /** Test-only: clears remembered decisions so tests don't inherit each other's state. */
+    public void reset() {
+        decisions.clear();
+    }
+    /** Test-only: pretend the bank already decided this payment. */
+    public void recordDecision(String paymentId, BankResult result) {
+        decisions.put(paymentId, result);
+    }
 
     private void sleepLikeARealBank() {
         if (maxLatencyMs <= 0) {

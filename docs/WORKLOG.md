@@ -1229,3 +1229,186 @@ feature.
   No reconciliation job exists.
 - Idempotency keys have no TTL and accumulate forever.
 - The idempotency race path is untested.
+
+## Day 19 — reconciling what the bank never answered (29 Aug 2026)
+
+**Built**
+- `PaymentProcessor.process` now wraps the bank call in a try/catch. On failure it
+  logs and returns the payment untouched, still `PENDING`.
+- `BankClient.lookup(String paymentId)` — ask the bank what happened to a payment
+  already sent. `FakeBankClient` implements it by remembering its own decisions in
+  a `ConcurrentHashMap`, returning null for an id it has no record of.
+- `V6__add_pending_payments_index.sql` — a **partial** index on
+  `payments (created_at) WHERE status = 'PENDING'`.
+- `PaymentRepository.findByStatusAndCreatedAtBefore` — the query that index exists
+  for.
+- `PaymentReconciler`, a `@Scheduled(fixedDelayString = "PT1M")` sweeper that finds
+  payments stranded past five minutes, asks the bank, and hands the answer to the
+  existing `settle`.
+- `@EnableScheduling` on `TransaktApplication`.
+- 22 tests still green. Committed as `64cf14d`, 10 files, 288 insertions.
+
+**Why**
+
+Day 18's WORKLOG called the stranded `PENDING` payment a crash scenario. Reading
+`PaymentProcessor` today showed that was too generous. There was no try/catch around
+`bankClient.authorize`, so any exception — a timeout, a connection reset — propagated
+straight out of `process`, past `settle`, to the caller as a 500. But `createPending`
+had **already committed**. The payment row and its idempotency key were sitting in the
+database at `PENDING` with nothing in the system that would ever touch them again.
+
+So stranding was not a rare crash. It was the ordinary behaviour of a bank timeout,
+reachable today with one config change to `FakeBankClient`.
+
+Worse, the idempotency key made it unrecoverable by retry: the same key returns the
+stranded payment rather than starting a fresh attempt. The mechanism that prevents
+double charges also prevented recovery.
+
+**Concepts**
+- *A failed call is not a failed payment.* When the bank call throws you know the
+  payment exists and you know you sent it. You do **not** know whether the bank acted.
+  Recording that as `FAILED` would tell the merchant nothing happened while the
+  customer's money may already be gone. `PENDING` already means exactly the right
+  thing — *the outcome is not known* — so no fourth status was needed.
+- *Reconciliation asks, it does not guess.* The sweeper's only honest move is to query
+  the bank. That requires a stable reference the bank recognises, stored before the
+  call. Day 18 already passed `pending.getId()` as the bank's transaction id, so the
+  reference existed before there was a use for it. No new column.
+- *Null is a real answer.* `lookup` returning null means the bank has no record — the
+  request never arrived. The sweeper leaves the payment `PENDING` and moves on. The
+  wrong instinct is to close it as `FAILED` "since the bank doesn't know about it",
+  which would settle a payment on the strength of a transient lookup failure. Doing
+  nothing is a valid outcome for a reconciler; it retries next sweep.
+- *Partial indexes.* `CREATE INDEX ... WHERE status = 'PENDING'` indexes only matching
+  rows, so it stays roughly the size of the stuck backlog forever rather than growing
+  with the table. The catch: Postgres uses it only when it can prove the query's WHERE
+  implies the index's WHERE. A query without `status = 'PENDING'` silently gets a
+  sequential scan, no error. This only works because `@Enumerated(EnumType.STRING)`
+  stores the literal text — under the ORDINAL default the column would hold integers
+  and the predicate would match nothing.
+- *`fixedDelay` over `fixedRate`.* fixedDelay counts from when the previous run
+  **finishes**, so a slow sweep cannot overlap itself. fixedRate fires on a clock and
+  will start a second run while the first is still going.
+- *Rejoin the path, don't fork it.* The sweeper calls the same `settle` the happy path
+  calls. Two code paths that both write ledger entries is how a ledger comes to
+  disagree with itself.
+
+**Interview line**
+
+"I found the bank call wasn't wrapped in a try/catch, so a timeout left the payment
+committed as PENDING with no outcome and no way back — and the idempotency key meant
+a retry returned that stranded payment instead of starting over. I added a lookup on
+the bank interface and a scheduled reconciler that asks what actually happened. The
+key decision was refusing to mark timeouts as failed: a failed call isn't a failed
+payment, and guessing there is how you tell a merchant nothing happened while the
+customer has already been charged."
+
+**Mistake & fix**
+
+I specified the reconciliation work in terms of `UUID` for the payment id. The code
+uses `String` throughout — `authorize(String paymentId, ...)` — so the first version
+of the decisions map wouldn't compile. Caught at compile time, one-line fix. The
+general shape is familiar from Day 12: check the actual file before writing against
+it, rather than inferring a type from what a JSON response looks like. Also lost a
+few minutes to prose being pasted into zsh again (`zsh: command not found: ←`), and
+to a stray `‹` left on the prompt line producing `command not found: ‹git`. Ctrl+U
+clears it.
+
+**Still open**
+- Step 7 not done: the two reconciler tests. Both need a payment aged past the cutoff
+  without waiting five minutes, and `FakeBankClient`'s map primed or empty on purpose.
+- `@Scheduled` runs on every instance. One instance on Render today, so it works;
+  two would sweep the same rows simultaneously.
+- The fake records its decision *after* the latency sleep, so an interrupt leaves no
+  record. That models "never reached the bank" but not the dangerous case — bank
+  decided, response lost. Worth a deliberate chaos switch when writing the tests.
+
+## Day 20 — pinning the reconciler (30 Aug 2026)
+
+**Built**
+- `ReconcilerIntegrationTest`, two tests:
+    - a payment stranded at PENDING that the bank approved is settled `CAPTURED`
+      with two balancing ledger entries;
+    - a payment stranded at PENDING that the bank has no record of is left
+      completely alone — status unchanged, ledger empty, sweep count zero.
+- `FakeBankClient.reset()` and `FakeBankClient.recordDecision(id, result)` — two
+  test-only hooks on a production class.
+- 24 tests green.
+
+**Why**
+
+Day 19 built the sweeper and shipped it untested. Two behaviours needed pinning, and
+the second is the one that matters.
+
+The first test asserts on **two ledger entries**, not just on the status. That is what
+proves the reconciler rejoined the existing `settle` rather than growing its own copy
+of the settlement logic. A future private copy wouldn't be caught by this test on the
+day it's written, but the moment the two implementations disagree about how many rows
+to write, this goes red.
+
+The second test pins a **non-action**. It asserts that an unknown payment is not
+touched. Most people wouldn't write it, because nothing happens and there's seemingly
+nothing to assert. But "close it as FAILED since the bank doesn't know about it" is
+the single most tempting wrong change anyone could make to this class, and it is the
+expensive bug — telling a merchant a payment failed while the customer may already
+have been charged. Now that change turns the build red.
+
+**Concepts**
+- *Testing a non-action.* A test whose subject is "nothing should happen" needs the
+  assertions written more carefully than one where something does, because every
+  assertion has to be positive about the absence: status is still PENDING, ledger has
+  zero rows, the sweep returned zero. Asserting only "no exception was thrown" would
+  pass against a reconciler that had deleted the row.
+- *Manufacturing time without waiting.* The sweeper only looks at payments older than
+  five minutes. Waiting is out. The test saves the payment with `createdAt` already
+  set ten minutes in the past — putting the database into the state a crash would
+  have left it in, rather than simulating the crash. This only works because
+  `createdAt` is a plain settable field. Under `@CreationTimestamp` or a `@PrePersist`
+  hook, Hibernate would overwrite the value and the test would fail by finding
+  nothing, which is a confusing way to learn about an annotation.
+- *Ids are application-assigned here.* The first run failed with `Identifier of entity
+  'Payment' must be manually assigned before calling 'persist()'`. `Payment.id` has no
+  `@GeneratedValue` — `PaymentService.createPending` generates it. Skipping the service
+  skipped the line that assigns it. Worth knowing: the id exists before the row does,
+  which is exactly why it can be handed to the bank as a reference.
+- *A deliberate exception to the suite's convention.* Every other integration test
+  drives through MockMvc and never touches a repository. This one autowires
+  `PaymentRepository`, `LedgerEntryRepository` and `PaymentReconciler` directly, and
+  it has to: a payment created through `POST /api/v1/payments` is settled by
+  `PaymentProcessor` before the response returns, so it is never PENDING and the
+  sweeper would find nothing. Testing through the front door is still the default;
+  this is what it looks like when the front door can't reach the state under test.
+- *Shared singletons carry state between tests.* `FakeBankClient` is one bean for the
+  whole context and its `decisions` map survives across tests. One test primes it, the
+  other needs it empty. Without `@BeforeEach fakeBankClient.reset()`, whichever ran
+  second would inherit the first's state and pass or fail on ordering — the same
+  flakiness as Day 18's random decline rate, arriving by a different route. Redis
+  needed `flushDb()` for exactly this reason on Day 11. In-memory state is a store too.
+
+**Interview line**
+
+"The test I'd point at is the one where nothing happens. When the bank has no record
+of a stranded payment, the reconciler must leave it alone — and the tempting change is
+to close it as failed and tidy up the stuck rows. That change would tell merchants a
+payment failed while the customer had already been charged. Pinning the non-action is
+what stops someone making that change later and it looking like an improvement."
+
+**Mistake & fix**
+
+I wrote the test against an entity I hadn't read, and it failed on `persist()` because
+`Payment.id` isn't generated. One line to fix. The broader pattern for the day is that
+everything I *did* check first — the `settle` signature, the existing test's shape,
+the repository method names — compiled first time, and the one thing I inferred rather
+than looked at is the one that broke. Same lesson as the `UUID` versus `String` mixup
+yesterday.
+
+**Still open**
+- `reset()` and `recordDecision()` are test-only methods on a production class. The
+  tidier alternative is a test-scoped subclass or a separate test configuration; not
+  worth the ceremony for two methods, but it is scaffolding living where it doesn't
+  belong.
+- The fake still records its decision *after* the latency sleep, so it cannot model
+  "bank decided, response lost" — the exact case the reconciler exists for. Both
+  tests plant state directly rather than exercising that path end to end.
+- `@Scheduled` still runs on every instance.
+- The Aiven Kafka cluster started on 29 Aug has not been checked since.

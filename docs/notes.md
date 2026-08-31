@@ -1687,3 +1687,135 @@ This is also the honest motivation for Kafka. Once you accept that the outcome
 arrives separately from the request, publishing an event and letting a consumer
 handle settlement stops being architecture cosplay and starts being the obvious
 shape of the problem.
+
+## Three things you can know, and the fourth you can't
+
+When a payment gateway calls a bank, there are four possible worlds and you can only
+ever distinguish three of them from where you're standing.
+
+1. **The call succeeded and the bank approved.** You have a response. Settle it.
+2. **The call succeeded and the bank declined.** You have a response. Settle it.
+3. **The call never left.** Connection refused, DNS failure, nothing sent. Nothing
+   happened at the bank.
+4. **The call left and the answer never came back.** Timeout, reset, your process
+   died mid-flight. The bank may have approved and charged the customer. You have
+   no idea.
+
+From inside your own code, 3 and 4 look **identical**. Both are an exception thrown
+by an HTTP client. There is no flag that says "this one reached them."
+
+That's the whole reason reconciliation exists. You cannot tell 3 from 4 locally, so
+you must ask the only party who can: the bank. Which means the payment needs a
+reference the bank will recognise, and that reference has to be written down *before*
+the call, because after the call is exactly when you might not get the chance.
+
+### Why this rules out the tempting shortcut
+
+The tempting shortcut is to catch the exception and mark the payment failed. It
+tidies up nicely: no stuck rows, no sweeper, merchant gets a clean answer.
+
+It's also the single most expensive bug a gateway can have. In world 4 you have just
+told a merchant the payment failed while the money has left the cardholder's account.
+The merchant doesn't ship. The customer is charged. Nobody in the system knows.
+
+Leaving the payment `PENDING` is uglier and correct. `PENDING` is not "we haven't
+tried yet." It means **the outcome is not known**, which is precisely true whether
+you haven't called yet or the call blew up. That's why no fourth status was needed —
+the state already existed and already meant the right thing.
+
+### The restaurant version
+
+The chef phones the supplier and the line drops mid-sentence. Did the order go
+through or not? You cannot tell from your end. The phone gives you the same dead
+tone either way.
+
+Writing "cancelled" on the slip is the shortcut, and it's how you end up with a
+delivery arriving for an order you told everyone wasn't placed. The slip stays on
+the rail, unmarked, until someone phones back and asks.
+
+Which only works if the slip has an order number the supplier can look up — written
+when the order was raised, not when the call was made.
+
+### What reconciliation is, in general
+
+A scheduled process that finds work in an unresolved state, asks an authoritative
+external system what actually happened, and moves the work to a resolved state.
+
+Three properties worth remembering:
+
+- **It must be idempotent.** It runs every minute, forever. Running twice on the same
+  row must be harmless.
+- **It must tolerate "I don't know."** If the authoritative system can't answer, the
+  correct action is to change nothing and try again later. A reconciler that forces
+  a resolution on every pass isn't reconciling, it's guessing on a schedule.
+- **It must not be a second implementation.** It reconstructs the missing input and
+  calls the same settlement code the normal path calls. The moment there are two
+  places that write ledger entries, you have two definitions of what settling means.
+
+## Testing that nothing happened
+
+Most tests assert that an action produced a result. Occasionally the correct behaviour
+*is* inaction, and those tests are written differently.
+
+The reconciler, asked about a payment the bank has no record of, must do nothing. Not
+"handle it gracefully" — nothing. Status untouched, no ledger rows, no side effects.
+
+The naive version of that test passes against code that is badly broken:
+
+```java
+// Useless.
+reconciler.reconcileStrandedPayments();   // no exception thrown, test passes
+```
+
+That would pass against a reconciler that deleted the payment, marked it FAILED, wrote
+ledger entries, or emailed the merchant. "Nothing crashed" is not "nothing happened."
+
+The real version asserts positively about each absence:
+
+```java
+assertThat(settled).isZero();                                   // it decided nothing
+assertThat(after.getStatus()).isEqualTo(PaymentStatus.PENDING);  // it changed nothing
+assertThat(ledgerEntryRepository.findByPaymentId(id)).isEmpty(); // it wrote nothing
+```
+
+Three assertions where the naive version had zero. The rule: for an inaction test,
+enumerate what the code *could* have touched and assert each one is untouched.
+
+### Why this particular one earns its place
+
+Every test costs something to maintain, so a test asserting nothing happens needs a
+reason. This one has the strongest kind: it guards the change someone will genuinely
+want to make.
+
+Stuck PENDING rows look like mess. The obvious tidy-up is to close them as FAILED —
+the bank has no record, so surely nothing happened. In a code review that reads as
+housekeeping. It is in fact the most expensive bug a gateway can ship, because "the
+bank has no record" and "the bank's lookup failed transiently" are indistinguishable
+from the outside, and the second one means the customer has already been charged.
+
+The test converts that review-approved improvement into a red build. That is the whole
+return on it.
+
+### The general shape
+
+Tests worth having are the ones guarding failures that would otherwise be **silent**.
+This project's existing examples all fit: removing `@JsonProperty(WRITE_ONLY)` from a
+password field, changing one login error message and reopening email enumeration,
+dropping the merchant id out of a rate-limit key. Each is a small change that looks
+fine in a diff and breaks something serious at runtime.
+
+"Do nothing when you don't know" belongs on that list. It looks like an omission, and
+it's a decision.
+
+### A note on shared test state
+
+`FakeBankClient` is one bean shared by every test in the context, and the map it uses
+to remember decisions survives between them. One test primes it; another needs it
+empty. Without a `@BeforeEach` reset, whichever runs second inherits the first's state
+and passes or fails on ordering.
+
+This is the same lesson as `flushDb()` on the Redis tests, and worth generalising:
+**test isolation is per-store, and a field on a singleton bean is a store.** `@Transactional`
+rolls back Postgres. It does not roll back Redis, and it does not roll back a
+`ConcurrentHashMap` living in a Spring bean.
+
