@@ -6,6 +6,9 @@ import com.transakt.transakt.common.ResourceNotFoundException;
 import com.transakt.transakt.ledger.EntryDirection;
 import com.transakt.transakt.ledger.LedgerEntry;
 import com.transakt.transakt.ledger.LedgerEntryRepository;
+import com.transakt.transakt.outbox.OutboxEvent;
+import com.transakt.transakt.outbox.OutboxEventRepository;
+
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -21,13 +24,16 @@ public class PaymentService {
     private final PaymentRepository paymentRepository;
     private final LedgerEntryRepository ledgerEntryRepository;
     private final IdempotencyKeyRepository idempotencyKeyRepository;
+    private final OutboxEventRepository outboxEventRepository;
 
     public PaymentService(PaymentRepository paymentRepository,
                           LedgerEntryRepository ledgerEntryRepository,
-                          IdempotencyKeyRepository idempotencyKeyRepository) {
+                          IdempotencyKeyRepository idempotencyKeyRepository,
+                          OutboxEventRepository outboxEventRepository) {
         this.paymentRepository = paymentRepository;
         this.ledgerEntryRepository = ledgerEntryRepository;
         this.idempotencyKeyRepository = idempotencyKeyRepository;
+        this.outboxEventRepository = outboxEventRepository;
     }
 
     @Transactional
@@ -50,38 +56,51 @@ public class PaymentService {
         return saved;
     }
 
+    /**
+     * One exit on purpose. Both outcomes are terminal and both are news the merchant
+     * needs, so both publish an event — writing it twice in two branches is how the
+     * two copies drift apart later. Ledger entries stay inside the approved branch:
+     * a declined payment moved no money and records no movement.
+     */
     @Transactional
     public Payment settle(String paymentId, boolean approved) {
         Payment payment = paymentRepository.findById(paymentId)
                 .orElseThrow(() -> new ResourceNotFoundException("Payment not found: " + paymentId));
 
-        if (!approved) {
-            payment.setStatus(PaymentStatus.FAILED);
-            return paymentRepository.save(payment);
+        payment.setStatus(approved ? PaymentStatus.CAPTURED : PaymentStatus.FAILED);
+        Payment settled = paymentRepository.save(payment);
+
+        if (approved) {
+            LedgerEntry credit = new LedgerEntry();
+            credit.setId(UUID.randomUUID().toString());
+            credit.setPaymentId(settled.getId());
+            credit.setAccount("merchant:" + settled.getMerchantId());
+            credit.setDirection(EntryDirection.CREDIT);
+            credit.setAmountPaise(settled.getAmountPaise());
+            credit.setCreatedAt(Instant.now());
+            ledgerEntryRepository.save(credit);
+
+            LedgerEntry debit = new LedgerEntry();
+            debit.setId(UUID.randomUUID().toString());
+            debit.setPaymentId(settled.getId());
+            debit.setAccount("gateway:incoming");
+            debit.setDirection(EntryDirection.DEBIT);
+            debit.setAmountPaise(settled.getAmountPaise());
+            debit.setCreatedAt(Instant.now());
+            ledgerEntryRepository.save(debit);
         }
 
-        payment.setStatus(PaymentStatus.CAPTURED);
-        Payment captured = paymentRepository.save(payment);
+        // Written in THIS transaction, alongside the payment it describes. Either both
+        // commit or neither does, so an event can never be lost.
+        outboxEventRepository.save(new OutboxEvent(
+                settled.getId(),
+                "payment.settled",
+                """
+                {"paymentId":"%s","status":"%s","amountPaise":%d,"currency":"%s"}"""
+                        .formatted(settled.getId(), settled.getStatus(),
+                                settled.getAmountPaise(), settled.getCurrency())));
 
-        LedgerEntry credit = new LedgerEntry();
-        credit.setId(UUID.randomUUID().toString());
-        credit.setPaymentId(captured.getId());
-        credit.setAccount("merchant:" + captured.getMerchantId());
-        credit.setDirection(EntryDirection.CREDIT);
-        credit.setAmountPaise(captured.getAmountPaise());
-        credit.setCreatedAt(Instant.now());
-        ledgerEntryRepository.save(credit);
-
-        LedgerEntry debit = new LedgerEntry();
-        debit.setId(UUID.randomUUID().toString());
-        debit.setPaymentId(captured.getId());
-        debit.setAccount("gateway:incoming");
-        debit.setDirection(EntryDirection.DEBIT);
-        debit.setAmountPaise(captured.getAmountPaise());
-        debit.setCreatedAt(Instant.now());
-        ledgerEntryRepository.save(debit);
-
-        return captured;
+        return settled;
     }
 
     public Page<Payment> getAllForCaller(String callerMerchantId, boolean isAdmin, Pageable pageable) {
