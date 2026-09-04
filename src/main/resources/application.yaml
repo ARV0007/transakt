@@ -13,6 +13,12 @@ spring:
     properties:
       hibernate:
         format_sql: true
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
   data:
     redis:
       host: ${REDIS_HOST:localhost}
@@ -26,8 +32,8 @@ spring:
     baseline-on-migrate: true
     baseline-version: 1
 
-    server:
-      port: ${PORT:8080}
+server:
+  port: ${PORT:8080}
 
 jwt:
   secret: ${JWT_SECRET:transakt-dev-secret-key-change-me-min-32-chars}
@@ -35,3 +41,6 @@ jwt:
 
 ratelimit:
   requests-per-minute: ${RATE_LIMIT_PER_MINUTE:20}
+
+outbox:
+  topic: ${OUTBOX_TOPIC:payment.settled}
