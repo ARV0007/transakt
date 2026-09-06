@@ -96,10 +96,9 @@ public class PaymentService {
                 settled.getId(),
                 "payment.settled",
                 """
-                {"paymentId":"%s","status":"%s","amountPaise":%d,"currency":"%s"}"""
-                        .formatted(settled.getId(), settled.getStatus(),
+                {"paymentId":"%s","merchantId":"%s","status":"%s","amountPaise":%d,"currency":"%s"}"""
+                        .formatted(settled.getId(), settled.getMerchantId(), settled.getStatus(),
                                 settled.getAmountPaise(), settled.getCurrency())));
-
         return settled;
     }
 

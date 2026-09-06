@@ -46,6 +46,9 @@ public class Merchant {
     @Column(nullable = false)
     private MerchantRole role = MerchantRole.MERCHANT;
 
+    @Column(name = "webhook_url", length = 512)
+    private String webhookUrl;
+
     @Column(name = "created_at", updatable = false)
     private Instant createdAt;
 }
