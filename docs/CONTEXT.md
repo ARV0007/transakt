@@ -202,16 +202,15 @@ com.transakt.transakt
 ├── common/     GlobalExceptionHandler, ResourceNotFoundException,
 │               InvalidCredentialsException, ApiKeyFilter, ApiKeyHasher,
 │               RateLimitFilter, SecurityConfig, PasswordConfig, WebConfig,
-│               RateLimitService
-│               ?? idempotency classes after the v1.4 rewrite — check `ls common/`
-│                  and `ls payment/`; IdempotencyConflictException was DELETED
+│               RateLimitService, IdempotencyService, IdempotencyKey (entity),
+│               IdempotencyKeyRepository
+│               IdempotencyConflictException was DELETED in v1.4 — unreachable
 ├── merchant/   Merchant (entity, has webhookUrl since V8), MerchantRole (enum),
 │               MerchantRepository, MerchantService, MerchantController
 ├── payment/    Payment, PaymentStatus (PENDING / CAPTURED / FAILED),
 │               CreatePaymentRequest (DTO), PaymentRepository,
 │               PaymentService (createPending + settle), PaymentProcessor,
 │               PaymentReconciler, PaymentController
-│               ?? IdempotencyKey entity + repository may live here
 ├── ledger/     LedgerEntry, EntryDirection (enum), LedgerEntryRepository
 ├── outbox/     OutboxEvent, OutboxEventRepository, OutboxPublisher
 ├── webhook/    WebhookConsumer, KafkaConfig
