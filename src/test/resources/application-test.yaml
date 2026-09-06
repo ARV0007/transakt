@@ -10,12 +10,15 @@ spring:
       database: 1
   flyway:
     baseline-on-migrate: false
+  kafka:
+    listener:
+      auto-startup: false
 
 ratelimit:
   requests-per-minute: 10000
 
-  bank:
-    decline-rate: 0
-    latency:
-      min-ms: 0
-      max-ms: 0
+bank:
+  decline-rate: 0
+  latency:
+    min-ms: 0
+    max-ms: 0
