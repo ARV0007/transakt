@@ -1412,3 +1412,103 @@ yesterday.
   tests plant state directly rather than exercising that path end to end.
 - `@Scheduled` still runs on every instance.
 - The Aiven Kafka cluster started on 29 Aug has not been checked since.
+
+
+## Days 21–22 — the event pipeline (5–6 Sep 2026)
+
+**Built**
+- `OutboxPublisher` — `@Scheduled(fixedDelayString = "PT5S")`, reads unpublished
+  outbox rows, sends each to the `payment.settled` topic keyed by `aggregateId`,
+  stamps `publishedAt` only after the broker confirms.
+- `spring.kafka` config block with `acks: all`, plus `outbox.topic` at top level.
+- Kafka in `docker-compose.yml`: `apache/kafka:4.0.0`, KRaft mode, two listeners.
+- `V8__add_merchant_webhook_url.sql` and `Merchant.webhookUrl`.
+- `merchantId` added to the outbox payload.
+- `WebhookConsumer` — `@KafkaListener` that POSTs the payload to the merchant's
+  webhook URL. Throws on failure by design.
+- `KafkaConfig` — `DefaultErrorHandler` with `FixedBackOff(2000, 2)` and a
+  `DeadLetterPublishingRecoverer`.
+- `OutboxPublisherTest`, three tests. 29 green.
+
+**Why**
+
+Day 20 left an outbox nobody consumed. Events accumulated with `published_at`
+null and nothing read them. The publisher closes that, and the consumer gives the
+whole thing a purpose: a merchant gets told when their payment settles.
+
+The consumer is where Kafka finally earns its place. A webhook call to a merchant's
+server is slow and can fail for reasons that have nothing to do with us. Doing it
+inline would put a third party's uptime directly on the payment request path —
+the same mistake as an unguarded bank call, one layer further out. On a consumer
+thread, a merchant whose server is down blocks nothing.
+
+**Concepts**
+- *Stamp after confirmation, never before.* `kafkaTemplate.send(...).get(...)`
+  waits for the broker. If the send fails the row stays unpublished and the next
+  sweep retries. Stamping first would let a failed send look published, which is
+  the exact loss the outbox exists to prevent — and it's why `acks: all` matters:
+  the confirmation has to mean the record is durably held.
+- *Key by aggregate id.* Kafka orders within a partition, not across a topic.
+  Using the payment id as the key puts every event for one payment on the same
+  partition, so a settled-then-refunded sequence can never arrive backwards.
+  Without a key, records round-robin and ordering is gone.
+- *Stop the sweep on failure, don't skip.* The publisher `break`s rather than
+  `continue`s. Skipping a failed event and publishing later ones would deliver
+  them out of order, which defeats the point of the key.
+- *At-least-once, not exactly-once.* If the send succeeds but the process dies
+  before the stamp commits, the next sweep publishes it again. Two systems cannot
+  be made atomic; you choose which side to fail on, and sending twice beats losing
+  it. Consumers must tolerate duplicates.
+- *An event carries what its consumer needs.* `merchantId` was added to the
+  payload so the consumer doesn't have to query the payments table. A consumer
+  reading the producer's database is exactly what events exist to avoid.
+- *Retries belong to the error handler, not the listener.* `WebhookConsumer` is
+  written as if delivery always succeeds and throws when it doesn't.
+  `DefaultErrorHandler` owns the retry policy and the dead letter. That keeps the
+  business logic readable and the failure policy in one place.
+- *A dead-letter topic makes failure inspectable.* Three attempts two seconds
+  apart, then the record goes to `payment.settled-dlt` — note the suffix is
+  `-dlt`, lowercase, not `.DLT`. A permanently broken merchant endpoint can't
+  block the partition forever, and nothing is silently dropped.
+- *Two listeners in compose, for two kinds of caller.* Containers reach the broker
+  at `kafka:29092`; the Mac reaches it at `localhost:9092`. A broker hands clients
+  its ADVERTISED address, so one address can't serve both. Get it wrong and the
+  client connects, is told to go somewhere unreachable, and hangs.
+
+**Interview line**
+
+"Settlement writes an event row in the same transaction as the payment, a
+scheduled publisher sweeps unpublished rows to Kafka and only marks them sent once
+the broker confirms, and a consumer delivers the webhook with retries and a dead
+letter. The point is that no single step can lose the event: the row is atomic
+with the payment, the stamp is atomic with a confirmed send, and a delivery that
+never succeeds lands in a topic I can inspect and replay rather than vanishing."
+
+**Verified end to end, 6 Sep.** Created a payment through the API, watched the
+event appear on `payment.settled` keyed by the payment id, pointed the merchant's
+`webhook_url` at a local server that rejects POST, and confirmed the retries ran
+and `payment.settled-dlt` was created.
+
+**Mistake & fix**
+
+`spring.kafka` was first pasted **inside** `properties: → hibernate:`, five spaces
+deep. Spring read it as a Hibernate property, Hibernate ignored it, and nothing
+warned. The same check caught an older one: `server:` had been nested inside
+`flyway:` since Day 14, so `server.port` was never read at all — invisible because
+Tomcat defaults to 8080 anyway and Render's port auto-detection covered for it.
+
+The general lesson, and it's the third time this project has hit it: **a
+misspelled YAML key fails loudly, a misplaced one fails silently.** And a value
+that's correct by accident looks identical to one that's correct by design, right
+up until the accident stops holding.
+
+**Still open**
+- **Tests now require a live Kafka broker.** Every `@SpringBootTest` starts the
+  `@KafkaListener` and connects to `localhost:9092`. CI has no broker, so the
+  pipeline will hang or fail. `spring.kafka.listener.auto-startup: false` in the
+  test profile is the fix.
+- No test covers `WebhookConsumer` or the dead-letter path — the proof is a manual
+  run, and manual runs don't execute in CI.
+- `@Scheduled` still runs on every instance.
+- Idempotency keys still have no TTL.
+- Free Render Postgres expires **17 September 2026**.

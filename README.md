@@ -21,14 +21,18 @@ curl -s https://transakt.onrender.com/api/v1/health
 
 | | |
 |---|---|
-| **Double-entry ledger** | Every payment appends two balancing rows. Balances are the sum of entries, never stored, never edited. Append-only, so the trail is tamper-evident. |
+| **Double-entry ledger** | Every approved payment appends two balancing rows. Balances are the sum of entries, never stored, never edited. Append-only, so the trail is tamper-evident. |
 | **Two authentication doors** | API keys for machines, JWTs for humans. Keys cost one indexed lookup; tokens verify against an HMAC in memory with no database hit. |
 | **Hashed API keys** | Stored as a public lookup prefix plus a SHA-256 hash. Shown to the merchant exactly once, at creation, and recoverable nowhere. |
 | **Ownership authorization** | Identity comes from the credential, never the request body. A foreign resource returns 404 rather than 403, so IDs can't be enumerated. |
-| **Idempotency keys** | `POST /payments` accepts an `Idempotency-Key`. A retry after a network timeout returns the original payment instead of charging twice. |
-| **Rate limiting** | 20 requests per merchant per minute, counted in Redis with a key that expires itself. |
+| **Idempotency keys** | `POST /payments` accepts an `Idempotency-Key`. A retry after a network timeout returns the original payment instead of charging twice. Enforced by a unique constraint inside the payment transaction, not by a lock. |
+| **Rate limiting** | 20 requests per merchant per minute, counted in Redis with a key that expires itself. Fails **open** when Redis is down, deliberately. |
 | **Versioned schema** | Flyway owns the database. Hibernate only validates. Every schema change is a numbered, checksummed, reviewable file. |
-| **19 integration tests** | Real HTTP through the full filter chain against a real database — run on every push by CI. |
+| **Two-transaction settlement** | The bank call sits *between* two transactions, so an 800ms third-party round trip never holds a pooled database connection. |
+| **Reconciliation** | A bank call that times out leaves a payment `PENDING`, not `FAILED` — you don't know whether the bank acted. A scheduled sweep asks and settles. |
+| **Transactional outbox** | The `payment.settled` event row commits with the payment. Either both exist or neither does, so an event cannot be lost. |
+| **Kafka + webhooks** | A publisher sweeps unpublished events to Kafka; a consumer delivers them to the merchant with retries and a dead-letter topic. |
+| **29 tests** | 27 integration tests through the full filter chain against a real database, plus 2 unit tests where the behaviour needs a dependency to fail on demand. |
 
 ---
 
@@ -43,14 +47,23 @@ flowchart LR
   rate -->|over limit| n429[429]
   rate --> ctrl[Controllers]
   ctrl --> svc[Services - ownership checks, transactional writes]
-  svc --> pg[(PostgreSQL - the truth)]
+  svc --> proc[PaymentProcessor - two transactions, bank call in the gap]
+  proc --> pg[(PostgreSQL - the truth)]
   svc --> redis[(Redis - facts that expire)]
+  pg --> pub[OutboxPublisher - every 5s]
+  pub --> kafka[[payment.settled]]
+  kafka --> wh[WebhookConsumer - retries, then dead letter]
 ```
 
 Three filters run before any controller. The first two record *who* the caller is without
 rejecting anything; the third enforces a per-merchant ceiling and needs an identity to count
 against, which is why it runs last. Controllers read identity from the security context and hand
 services plain values, so the service layer never imports a Spring Security type.
+
+Creating a payment is **two** transactions, not one. The first commits the payment as `PENDING`;
+the bank call then happens with no transaction open and no connection held; the second records
+the outcome, the ledger entries and an outbox event together. Holding a pooled connection across
+a third party's network is how a slow bank becomes an unavailable database.
 
 ---
 
@@ -90,6 +103,19 @@ curl -s "https://transakt.onrender.com/api/v1/payments?page=0&size=20" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
+**5. Watch the event pipeline** (local only — Kafka isn't deployed). Settling a payment writes an
+outbox event in the same transaction, a scheduled publisher sends it to Kafka, and a consumer
+POSTs it to your `webhook_url`.
+
+```bash
+kafka-console-consumer --bootstrap-server localhost:9092 \
+  --topic payment.settled --from-beginning --property print.key=true
+# 8fbe4ddf-...  {"paymentId":"8fbe4ddf-...","merchantId":"93a19e06-...","status":"CAPTURED",...}
+```
+
+A delivery that fails three times lands in `payment.settled-dlt` rather than being retried
+forever or dropped.
+
 ---
 
 ## Endpoints
@@ -105,11 +131,15 @@ curl -s "https://transakt.onrender.com/api/v1/payments?page=0&size=20" \
 | `GET` | `/api/v1/payments/{id}` | authenticated; 404 unless yours or admin |
 | `GET` | `/api/v1/payments/{id}/ledger` | authenticated; 404 unless yours or admin |
 
+A payment moves `PENDING → CAPTURED` on approval, or `PENDING → FAILED` on decline. A bank call
+that times out leaves it `PENDING` until the reconciler resolves it, because a timeout means the
+outcome is unknown rather than negative.
+
 ---
 
 ## Run it locally
 
-One command. Postgres, Redis and the app.
+One command. Postgres, Redis, Kafka and the app.
 
 ```bash
 docker compose up
@@ -117,7 +147,7 @@ docker compose up
 
 Then `curl -i http://localhost:8080/api/v1/health`.
 
-The schema builds itself — Flyway applies four migrations against the empty containerised
+The schema builds itself — Flyway applies eight migrations against the empty containerised
 database at startup, so there is no setup SQL to run and nothing to configure.
 
 **Tests:**
@@ -126,15 +156,17 @@ database at startup, so there is no setup SQL to run and nothing to configure.
 ./mvnw test
 ```
 
-Nineteen integration tests, about twenty seconds. Needs Postgres and Redis reachable on
-localhost — `docker compose up` provides both.
+Twenty-nine tests, about forty seconds. Needs Postgres, Redis **and Kafka** reachable on
+localhost — `docker compose up` provides all three. The Kafka dependency in tests is a known
+problem; see limitations.
 
 ---
 
 ## Stack
 
 Java 21 · Spring Boot 3.4.1 · Spring Security · Spring Data JPA · PostgreSQL 18 · Redis
-(Valkey in production) · Flyway · jjwt · Maven · Docker · GitHub Actions · deployed on Render
+(Valkey in production) · Apache Kafka 4.0 (KRaft) · Spring Kafka · Flyway · jjwt · Maven ·
+Docker · GitHub Actions · deployed on Render
 
 ---
 
@@ -152,8 +184,30 @@ Each of these was a choice with a trade-off rather than a default, and each is w
 - **API keys can't be BCrypted.** A password lookup has an email to find the row first; an API key
   *is* the identity, so a salted hash would mean comparing against every row. An indexed prefix
   plus one SHA-256 comparison is constant time — the same shape as Stripe's `sk_live_` keys.
-- **Idempotency uses `SET NX`, not `EXISTS` then `SET`.** Two simultaneous retries can both pass
-  a separate check. The atomicity is the entire mechanism.
+- **Idempotency is a unique constraint, not a lock.** Two simultaneous retries race at the
+  database: the second blocks, then fails on `UNIQUE (merchant_id, idempotency_key)`, and the
+  controller recovers by re-reading and returning the winner's payment. The race is detected and
+  recovered from rather than prevented, because the database already serialises writes.
+- **The bank call sits between two transactions.** A `@Transactional` method holds a pooled
+  connection until commit, so an 800ms third-party call inside one drains the pool under load and
+  a slow bank becomes an unavailable database.
+- **A timeout is not a decline.** When the bank call throws you know you sent the request but not
+  whether it acted. Recording that as `FAILED` would tell a merchant nothing happened while the
+  customer's money may already be gone, so the payment stays `PENDING` for the reconciler.
+- **The reconciler calls the same `settle` the happy path uses.** Two code paths that both write
+  ledger entries is how a ledger comes to disagree with itself.
+- **The outbox event commits with the payment.** Publishing after the transaction leaves a window
+  where the payment settled and the event was never sent — which here means a merchant is never
+  told, so they don't ship, and nothing in the system looks wrong.
+- **The publisher stamps `published_at` only after the broker confirms.** Stamping first would let
+  a failed send look published, which is the exact loss the outbox exists to prevent.
+- **Fail open for rate limiting, fail safe for idempotency.** Same infrastructure, same failure
+  mode, opposite correct answers: letting a request past a dead limiter costs a burst of traffic,
+  letting a retry past a dead idempotency check charges a customer twice.
+- **Retries belong to the error handler, not the listener.** `WebhookConsumer` is written as if
+  delivery always succeeds and throws when it doesn't, so the failure policy lives in one place
+  and a permanently broken merchant endpoint lands in a dead-letter topic instead of blocking the
+  partition forever.
 - **Tests are integration tests deliberately.** A mocked unit test of the service layer passes
   happily while the security config is wide open.
 - **One artifact, three environments.** Every external address is `${VAR:default}`, so the same
@@ -165,22 +219,41 @@ Each of these was a choice with a trade-off rather than a default, and each is w
 
 Stated rather than discovered:
 
-- **Rate limiting behaviour when Redis is unreachable is accidental**, returning an empty-bodied
-  403. The fail-open versus fail-closed decision hasn't been made deliberately — and the right
-  answer differs for idempotency, where failing open means charging a customer twice.
+- **Tests require a live Kafka broker.** Every `@SpringBootTest` starts the `@KafkaListener`
+  against `localhost:9092`, and CI has no broker, so the pipeline is currently unreliable.
+  `spring.kafka.listener.auto-startup: false` in the test profile closes it.
+- **The event pipeline is local-only.** Render offers no managed Kafka and the development
+  network blocks Aiven at DNS, so the deployed instance accumulates unpublished outbox rows.
+- **`@Scheduled` runs on every instance.** Two copies of the app would sweep the same rows
+  simultaneously. `SELECT ... FOR UPDATE SKIP LOCKED` or ShedLock is the fix.
+- **Webhook delivery is at-least-once with no event id**, so merchants have nothing to
+  deduplicate on. Stripe includes one for exactly this reason.
+- **The webhook consumer and dead-letter path are untested.** Verified by hand, not by CI.
+- **Outbox rows and idempotency keys are never deleted.** Two slow leaks, both fixable with a
+  scheduled cleanup.
+- **A stranded payment isn't recoverable by retry.** The reconciler resolves it, but the
+  idempotency key means a retry returns the stranded payment rather than starting fresh.
 - **Unauthenticated traffic isn't rate limited.** The filter needs an identity to count against,
   so `/auth/login` has no ceiling. Production gateways add an IP-keyed limiter.
 - **Fixed-window rate limiting allows a boundary burst** — 20 either side of a minute boundary is
   40 in two seconds. Sliding windows via sorted sets fix it at more complexity.
 - **Idempotency keys aren't fingerprinted against the request body.** Reusing a key with a
   different amount returns the original payment; Stripe returns 422.
+- **The idempotency race path is untested.** The test class is `@Transactional`, so a constraint
+  violation would poison the test's own transaction and the recovery block never runs.
 - **Offset pagination degrades with depth.** Cursors keyed on `(created_at, id)` are the standard
   answer.
-- **No foreign key constraints.** `merchantId` and `paymentId` are scalar columns rather than JPA
+- **Only one foreign key constraint exists.** `idempotency_keys.payment_id` references
+  `payments(id)`; `merchantId` and `paymentId` elsewhere are scalar columns rather than JPA
   associations, so only the service layer prevents an orphan.
 - **The API key prefix carries ~20 bits of entropy.** Collisions become plausible near a thousand
   merchants.
 - **JWTs cannot be revoked before they expire.** The one-hour lifetime is the mitigation.
+- **There is no endpoint to set `webhook_url`.** It is set directly in the database today.
+- **Dependency CVEs are unaudited.** Spring Boot 3.4.1 pulls transitive versions with known
+  advisories.
+- **The free Postgres expires 17 September 2026.** The schema rebuilds from migrations, so the
+  loss is demo data rather than capability.
 
 ---
 
@@ -191,12 +264,23 @@ Stated rather than discovered:
 - [`docs/WORKLOG.md`](docs/WORKLOG.md) — daily entries: what was built, why, what broke, what it
   taught
 - [`docs/architecture.md`](docs/architecture.md) — versioned architecture with diagrams, currently
-  v1.3
+  v1.6
 - [`docs/CONTEXT.md`](docs/CONTEXT.md) — the full current state of the project in one file
 
 ---
 
 ## Roadmap
 
-Kafka for payment events and webhook delivery with retries and a dead-letter queue · a bank
-simulator to replace the last pretend part · Kubernetes as a deliberate exercise · Spring AI
+**Next, in order of how much they matter:**
+
+- `spring.kafka.listener.auto-startup: false` in the test profile, so CI stops depending on a
+  broker that only one test cares about
+- Tests for `WebhookConsumer` and the dead-letter path
+- An event id in the webhook payload, so merchants can deduplicate an at-least-once delivery
+- Scheduled cleanup for published outbox rows and expired idempotency keys
+- `PATCH /api/v1/merchants/me` to set `webhook_url` through the API rather than through psql
+
+**Later, if the project continues:** refunds as a second event type on the same outbox ·
+`SELECT ... FOR UPDATE SKIP LOCKED` so the schedulers survive more than one instance ·
+splitting webhook delivery into its own deployable service consuming the same topic ·
+a real acquirer as a second `BankClient` adapter

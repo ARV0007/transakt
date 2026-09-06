@@ -1819,3 +1819,65 @@ This is the same lesson as `flushDb()` on the Redis tests, and worth generalisin
 rolls back Postgres. It does not roll back Redis, and it does not roll back a
 `ConcurrentHashMap` living in a Spring bean.
 
+## Why the webhook is a consumer and not a method call
+
+When a payment settles, the merchant needs to know. The obvious implementation is
+to POST to their URL right there in `settle`.
+
+Don't.
+
+### The restaurant version
+
+A customer's order is ready. The kitchen also has to phone the customer's office
+to tell them. If the chef makes that call personally, standing at the pass, then a
+customer whose office phone rings out has stopped the entire kitchen. Every other
+order waits behind a phone call that has nothing to do with them.
+
+You hand the message to someone whose job is making phone calls. The kitchen keeps
+cooking. If the office doesn't answer, that's the caller's problem to retry, not
+the kitchen's problem to wait on.
+
+### The technical version
+
+A merchant's webhook endpoint is a third party. It can be slow, down, or return
+garbage, and none of that is under your control. Calling it inline means:
+
+- The payment request holds a thread until the merchant's server responds.
+- A slow merchant makes your API slow for that merchant's own payments.
+- If the POST fails, you're stuck: you can't fail the payment (it succeeded), and
+  you have nowhere to put the fact that delivery didn't happen.
+
+Publishing an event and letting a consumer deliver it fixes all three. The payment
+path ends when the event row commits. Delivery happens on a consumer thread, at
+its own pace, with its own failure handling.
+
+### Retries and the dead letter
+
+`DefaultErrorHandler` with a `FixedBackOff` retries a failed delivery a fixed
+number of times, then hands the record to a `DeadLetterPublishingRecoverer` which
+republishes it to `payment.settled-dlt`.
+
+Two properties matter and they pull in opposite directions.
+
+**Retries must be bounded.** Kafka delivers records in a partition in order. If
+one record retries forever, everything behind it waits. A single permanently
+broken merchant would stop deliveries for every other merchant on that partition.
+
+**Failures must not be dropped.** Giving up silently means a merchant is never
+told about a payment and nobody knows.
+
+The dead-letter topic satisfies both. Give up after three attempts so the
+partition moves on, but give up *into a place you can look at*. A DLT with records
+in it is an alert. A DLT you can replay is a recovery plan.
+
+### What this doesn't solve
+
+The consumer is at-least-once. If delivery succeeds but the offset commit fails,
+the same webhook is sent again. Real gateways handle this by including an event id
+the merchant can deduplicate on — Stripe does exactly this, and it's the same
+reasoning behind idempotency keys on the inbound side. Transakt doesn't yet.
+
+Also worth naming: adding a consumer to the same application is a stepping stone,
+not a destination. In production, webhook delivery would be its own deployable
+service consuming the same topic. The event boundary is what makes that a
+deployment change rather than a rewrite.

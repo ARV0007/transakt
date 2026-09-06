@@ -34,6 +34,10 @@ The bank is simulated; no real money moves.
   - Flyway = the renovation logbook — every change to the building is a numbered, dated entry
   - Docker = the restaurant packed into a shipping container, kitchen and all
   - Render = the plot of land in Singapore the container was set down on
+  - BankClient = the card machine — the kitchen doesn't care which bank is on the other end
+  - Outbox = the order slip spiked next to the till the moment the meal is paid for
+  - Kafka = the runner who carries slips from the spike to whoever needs them
+  - WebhookConsumer = the person who phones the customer's office to say the order is ready
 
 ---
 
@@ -47,14 +51,20 @@ The bank is simulated; no real money moves.
 - **`psql` is not on the PATH** — binaries at `/Applications/Postgres.app/Contents/Versions/latest/bin/`
 - **Redis 8.10 via Homebrew.** `brew services start redis` **fails** on this machine — run
   `redis-server` in a dedicated Terminal tab instead. *Or, since Day 13, just use compose.*
+- **Kafka 4.0 in docker-compose** since Day 21. `kafka-topics` / `kafka-console-consumer` CLI
+  installed locally via Homebrew for inspection.
 - **Docker Desktop** — must be *running*, not just installed (see gotchas)
 - Postman for API testing
 - Project path: `~/Documents/Coding/transakt` · alias `tk` in `~/.zshrc` (new tabs only)
 
-**To run everything locally:** `docker compose up` — Postgres, Redis and the app, one command.
-**To run the tests:** Redis and Postgres up, then `./mvnw test`. Expect 19 tests, ~20 seconds.
+**To run everything locally:** `docker compose up` — Postgres, Redis, Kafka and the app.
+**To run the tests:** all three stores up, then `./mvnw test`. Expect 29 tests, ~40 seconds.
 **Before running the app bare:** `lsof -ti :8080 | xargs kill` — a leftover instance is the usual
 cause of "port already in use", and a failed startup means Flyway never ran.
+
+**Campus network blocks `*.aivencloud.com` at DNS**, including external resolvers. An Aiven Kafka
+cluster (`transakt-kafka`, Free-0, Asia Pacific) exists and is Running but is unreachable from
+here, which is why Kafka runs in compose instead.
 
 ---
 
@@ -65,18 +75,26 @@ cause of "port already in use", and a failed startup means Flyway never ran.
 - Dependencies: spring-boot-starter-**web** (not webmvc), validation, data-jpa, security,
   **data-redis**, devtools, postgresql, lombok, spring-boot-starter-**test** (not webmvc-test),
   **flyway-core** and **flyway-database-postgresql** (the second is mandatory from Flyway 10 —
-  Postgres support moved out of core)
+  Postgres support moved out of core), **spring-kafka**
 - **jjwt 0.13.0** — three artifacts: `jjwt-api` (compile), `jjwt-impl` (runtime),
   `jjwt-jackson` (runtime). Needs explicit `<version>` tags; the parent POM doesn't manage it.
+- **Apache Kafka 4.0.0** in compose, **KRaft mode** — no ZooKeeper. Most tutorials still show a
+  separate `zookeeper` service; that's the pre-4.x architecture.
 - **`ddl-auto: validate`** (Flyway owns the schema since Day 12a), `show-sql: true`,
   `open-in-view: false`
 - `spring.flyway.baseline-on-migrate: true`, `baseline-version: 1` — for the dev database,
   which already had tables before migrations existed. The **test** profile overrides this to
   `false` on purpose, so a non-empty test schema fails loudly rather than silently skipping V1.
 - `spring.data.web.pageable.max-page-size: 100` — nested inside the existing `data:` block
+- `spring.kafka` — a **sibling of `datasource:` and `jpa:`**, not nested inside either.
+  `bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}`, String serializers,
+  **`acks: all`**.
+- `outbox.topic: ${OUTBOX_TOPIC:payment.settled}` — top level.
+- `@EnableScheduling` on the application class; without it `@Scheduled` is silently inert.
 - **Everything external is parameterised** (Day 13/14):
   `${DB_HOST:localhost}`, `${DB_NAME:transakt}`, `${DB_USER:aman}`, `${DB_PASSWORD:}`,
   `${REDIS_HOST:localhost}`, `${REDIS_PORT:6379}`, `${REDIS_PASSWORD:}`,
+  `${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}`,
   `${PORT:8080}` (top level, sibling of `spring:`),
   `${JWT_SECRET:default}` (32-char minimum for HS256), `jwt.expiration-ms: 3600000`,
   `ratelimit.requests-per-minute: ${RATE_LIMIT_PER_MINUTE:20}`
@@ -84,7 +102,7 @@ cause of "port already in use", and a failed startup means Flyway never ran.
 
 ---
 
-## Current state: Day 14 complete — deployed and live
+## Current state: Day 22 complete — feature work done
 
 | Day | What was built |
 |-----|----------------|
@@ -104,13 +122,28 @@ cause of "port already in use", and a failed startup means Flyway never ran.
 | 12c | **API keys stored hashed** — lookup prefix + SHA-256, migrated via expand/contract |
 | 13 | **Docker + docker-compose** — multi-stage build, three services, healthchecks |
 | 14 | **Deployed to Render** — managed Postgres and Key Value, HTTPS, public URL |
+| 15 | **CI on GitHub Actions** — Postgres and Redis service containers, green on push |
+| 16 | **`/error` permitAll** (a 403 was masking every 500); **rate limiter fails open** by design, with the project's first unit test |
+| 17 | **Idempotency moved into Postgres** — `UNIQUE (merchant_id, idempotency_key)`, written inside the payment transaction (V5) |
+| 18 | **`BankClient` port + `FakeBankClient`**; payment creation split into **two transactions** with the bank call in the gap; ledger entries only on approval; `PENDING` becomes a real state |
+| 19 | **`PaymentReconciler`** — sweeps stranded `PENDING` payments, asks the bank, calls the same `settle` (V6 partial index) |
+| 20 | **Transactional outbox** — `outbox_events` written in the same transaction as settlement (V7) |
+| 21 | **Kafka in compose (KRaft)**, `OutboxPublisher`, `WebhookConsumer`, `KafkaConfig` with retries and a DLT, `merchants.webhook_url` (V8) |
+| 22 | **End-to-end verification** of the retry and dead-letter path; docs to v1.6 |
 
-Architecture doc is at **v1.3**. All four docs cover Days 13–14.
+Architecture doc is at **v1.6**. Latest commit before the docs pass: `e3c11f3`.
 
 **Verified working in production (23 Aug):**
 `GET /health` 200 · signup 200 · login 200 · `GET /payments` 200 (paginated, scoped) ·
 `POST /payments` 201 CAPTURED · idempotent replay returns the same payment ·
 25-request loop returns 19×200 then 6×429.
+
+**Verified working locally (6 Sep):** a payment created through the API produced an event on
+`payment.settled` keyed by the payment id. With `webhook_url` pointed at a server that rejects
+POST, the consumer retried three times two seconds apart and **`payment.settled-dlt` was created**.
+Payment `8fbe4ddf-c296-4978-817b-74c42d3a469a`, CAPTURED, 75000 paise.
+
+**The event pipeline does not run on Render** — there is no broker there.
 
 **Test accounts (Render database):** `third@shop.com` / `hunter2` and
 `keytest@shop.com` / `hunter2`, both MERCHANT. There is **no ADMIN on Render** — role is
@@ -118,8 +151,9 @@ server-controlled at signup, so `/api/v1/merchants/**` returns 403 there. That i
 not a bug.
 
 **Test accounts (local dev database):** `test@shop.com` / `hunter2` = ADMIN ·
-`regular@shop.com` / `hunter2` = MERCHANT. The `priya@` merchants predate the password
-column and cannot log in. The test suite creates and rolls back its own merchants.
+`regular@shop.com` / `hunter2` = MERCHANT · `outbox-demo@shop.com` / `hunter2` = MERCHANT,
+with `webhook_url` set to a local endpoint for the webhook demo. The `priya@` merchants predate
+the password column and cannot log in. The test suite creates and rolls back its own merchants.
 
 **API keys are unrecoverable.** They exist only in the response to the request that created
 the merchant. To test the API-key path, create a merchant and keep the key from that response.
@@ -133,16 +167,19 @@ the merchant. To test the API-key path, create a merchant and keep the key from 
 | Web Service | `transakt` | `srv-da2dip3m8hqs73em2g70`, Docker, Free, Singapore, `main`, Auto-Deploy on |
 | Postgres | `transakt-db` | PG 18, Singapore, Free — **expires 17 Sept 2026** |
 | Key Value | `transakt-redis` | **Valkey 8**, Singapore, Free, `allkeys-lru`, `red-da4tkjrncjis73f3t9q0` |
+| Kafka | — | **none.** No managed Kafka on any Render tier; Aiven is DNS-blocked from campus |
 
 **Env vars on the web service:** `DB_HOST`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`,
 `JWT_SECRET`, `REDIS_HOST`, `REDIS_PORT`. **No `REDIS_PASSWORD`** — internal authentication
-is off, so internal traffic needs none. Health check path `/api/v1/health`.
+is off, so internal traffic needs none. **No `KAFKA_BOOTSTRAP_SERVERS`**, so the deployed app
+falls back to `localhost:9092`, finds nothing, and accumulates unpublished outbox rows.
+Health check path `/api/v1/health`.
 
 **Things to know about the free tier:**
 - The web service **spins down after 15 minutes idle**. First request after that has taken up
   to **2 minutes**, not the 50 seconds Render advertises. Say so when sharing the link.
 - Postgres **expires 30 days after creation**, then 14 days grace, then permanent deletion.
-  Loss would be demo data, not the ability to run — the schema rebuilds from four migrations.
+  Loss would be demo data, not the ability to run — the schema rebuilds from eight migrations.
 - One Key Value instance per workspace. This matters (see gotchas).
 - Postgres defaults to inbound `0.0.0.0/0`; Key Value defaults to blocking all external
   traffic. Two data stores, two security postures, neither chosen deliberately.
@@ -159,51 +196,75 @@ project card to find them.
 com.transakt.transakt
 ├── auth/       JwtService, JwtAuthFilter, AuthService, AuthController,
 │               LoginRequest, LoginResponse
+├── bank/       BankClient (interface: authorize + lookup), BankResult (enum),
+│               FakeBankClient (configurable latency + decline rate, remembers
+│               its decisions in a ConcurrentHashMap, reset() for tests)
 ├── common/     GlobalExceptionHandler, ResourceNotFoundException,
-│               InvalidCredentialsException, IdempotencyConflictException,
-│               ApiKeyFilter, ApiKeyHasher, RateLimitFilter, SecurityConfig,
-│               PasswordConfig, WebConfig, IdempotencyService, RateLimitService
-├── merchant/   Merchant (entity), MerchantRole (enum), MerchantRepository,
-│               MerchantService, MerchantController
-├── payment/    Payment, PaymentStatus (enum), CreatePaymentRequest (DTO),
-│               PaymentRepository, PaymentService, PaymentController
+│               InvalidCredentialsException, ApiKeyFilter, ApiKeyHasher,
+│               RateLimitFilter, SecurityConfig, PasswordConfig, WebConfig,
+│               RateLimitService
+│               ?? idempotency classes after the v1.4 rewrite — check `ls common/`
+│                  and `ls payment/`; IdempotencyConflictException was DELETED
+├── merchant/   Merchant (entity, has webhookUrl since V8), MerchantRole (enum),
+│               MerchantRepository, MerchantService, MerchantController
+├── payment/    Payment, PaymentStatus (PENDING / CAPTURED / FAILED),
+│               CreatePaymentRequest (DTO), PaymentRepository,
+│               PaymentService (createPending + settle), PaymentProcessor,
+│               PaymentReconciler, PaymentController
+│               ?? IdempotencyKey entity + repository may live here
 ├── ledger/     LedgerEntry, EntryDirection (enum), LedgerEntryRepository
+├── outbox/     OutboxEvent, OutboxEventRepository, OutboxPublisher
+├── webhook/    WebhookConsumer, KafkaConfig
 ├── HealthController
-└── TransaktApplication
+└── TransaktApplication          (@EnableScheduling)
 
 project root
 ├── Dockerfile              multi-stage: maven:3.9-eclipse-temurin-21 → eclipse-temurin:21-jre
 ├── .dockerignore           target/, .git/, .idea/, *.iml, .DS_Store, docs/
-└── docker-compose.yml      postgres:18 + redis:8-alpine + app, healthchecked
+└── docker-compose.yml      postgres:18 + redis:8-alpine + apache/kafka:4.0.0 + app
 
 src/main/resources/db/migration
-├── V1__initial_schema.sql          the schema as it stood after Day 11
-├── V2__add_query_indexes.sql       idx_payments_merchant_id, idx_ledger_entries_payment_id
-├── V3__hash_api_keys.sql           expand: prefix + hash columns, backfilled
-└── V4__drop_plaintext_api_key.sql  contract: NOT NULL, then DROP COLUMN api_key
+├── V1__initial_schema.sql              the schema as it stood after Day 11
+├── V2__add_query_indexes.sql           idx_payments_merchant_id, idx_ledger_entries_payment_id
+├── V3__hash_api_keys.sql               expand: prefix + hash columns, backfilled
+├── V4__drop_plaintext_api_key.sql      contract: NOT NULL, then DROP COLUMN api_key
+├── V5__add_idempotency_keys.sql        table + UNIQUE (merchant_id, idempotency_key), FK to payments
+├── V6__add_pending_payments_index.sql  partial: payments (created_at) WHERE status = 'PENDING'
+├── V7__add_outbox_events.sql           table + partial index WHERE published_at IS NULL
+└── V8__add_merchant_webhook_url.sql    merchants.webhook_url VARCHAR(512), nullable
 
 src/test/java/com/transakt/transakt
-├── TransaktApplicationTests      smoke test — the context loads
-├── AuthIntegrationTest           6 tests
-├── OwnershipIntegrationTest      5 tests
-├── IdempotencyIntegrationTest    5 tests
-└── RateLimitIntegrationTest      2 tests
+├── TransaktApplicationTests           smoke test — the context loads       (1)
+├── AuthIntegrationTest                                                     (6)
+├── OwnershipIntegrationTest                                                (5)
+├── IdempotencyIntegrationTest                                              (5)
+├── RateLimitIntegrationTest                                                (2)
+├── RateLimitServiceTest               unit — mocked StringRedisTemplate    (1)
+├── ApprovedPaymentIntegrationTest                                          (1)
+├── DeclinedPaymentIntegrationTest                                          (1)
+├── ReconcilerIntegrationTest                                               (2)
+├── OutboxIntegrationTest                                                   (2)
+└── OutboxPublisherTest                unit — mocked KafkaTemplate          (3)
+                                                                    total = 29
 
 src/test/resources/application-test.yaml    the `test` profile
 ```
 
 **Never edit an applied migration.** Flyway stores a checksum; editing V1 after it has run
-breaks every subsequent startup. The schema is wrong? Write V5.
+breaks every subsequent startup. The schema is wrong? Write V9.
+
+**There are eight migration files, not nine.** Flyway on the *dev* database reports nine
+because the baseline marker row counts as a version. `ls` the folder to check reality.
 
 ---
 
 ## Key design decisions (and why)
 
-- **Double-entry ledger** — every payment appends two balancing rows. Balances are the sum of
-  entries, never stored. Append-only, so the trail is tamper-evident.
+- **Double-entry ledger** — every approved payment appends two balancing rows. Balances are the
+  sum of entries, never stored. Append-only, so the trail is tamper-evident.
 - **Money as integer paise** (`Long`), never decimals. ₹500 = 50000.
-- **`@Transactional` on payment creation** — payment row and both ledger entries commit
-  together or not at all.
+- **Ledger entries are written only on approval** (Day 18). A ledger row asserts that money
+  moved; a declined payment moved nothing, so its ledger is legitimately empty.
 - **Server-controlled fields** — id, status, createdAt, role and **merchantId** are set by the
   server. A client cannot choose its own identity any more than its own id.
 - **Layered architecture** — controller (HTTP only) → service (rules) → repository (data).
@@ -213,15 +274,62 @@ breaks every subsequent startup. The schema is wrong? Write V5.
 - **Foreign resources return 404, not 403** — a 403 confirms the ID is real. Both cases use an
   identical message, which is what makes it work.
 - **Fetch-then-check for one, scope-the-query for many.**
-- **Two state stores** — Postgres for the truth, Redis for facts that expire. TTL means no
-  cleanup job exists anywhere in the codebase.
-- **Idempotency keys on `POST /payments`** — atomic `SET NX EX`, scoped per merchant, 24h TTL.
-- **Idempotency orchestration is in the controller** — because self-invocation would bypass
-  Spring's `@Transactional` proxy.
+- **Three stores** — Postgres for the truth (including idempotency keys and outbox events),
+  Redis for facts that expire, Kafka for events in transit. Kafka is **not** the source of truth;
+  the outbox row is what makes losing a message survivable.
+- **Idempotency is a unique constraint, not a lock** (Day 17). The key row commits inside the
+  same transaction as the payment. Two simultaneous retries race at the database: the second
+  blocks, fails with `DataIntegrityViolationException`, and the controller re-reads and returns
+  the winner's payment. No `IN_PROGRESS` state, no `release()`, no 409 — all three were
+  compensating machinery for a two-phase commit hand-rolled across Redis and Postgres.
+- **The catch for that violation must be OUTSIDE the transactional method** — once a constraint
+  fires the transaction is rollback-only, so catching inside poisons every subsequent query.
 - **Rate limiting via `INCR`** on a key containing the current minute, so the window resets by
-  itself when the key name changes. The counter is per merchant per minute across **all**
-  authenticated endpoints, not per endpoint.
+  itself when the key name changes. Per merchant per minute across **all** authenticated
+  endpoints, not per endpoint.
+- **Fail open for the rate limiter, fail safe for idempotency** (Day 16). Same infrastructure,
+  same failure mode, opposite correct answers. The catch is narrow —
+  `RedisConnectionFailureException`, not `Exception` — so a bug in the key-building code doesn't
+  silently disable the limiter.
+- **The bank call sits between two transactions** (Day 18). A `@Transactional` method holds a
+  pooled connection until commit; an 800ms third-party call inside one drains the pool, and a
+  slow bank becomes an unavailable database on endpoints that have nothing to do with banks.
+- **`PaymentProcessor` is a separate bean**, not a third method on `PaymentService` —
+  self-invocation bypasses Spring's proxy and the `@Transactional` annotations would do nothing.
+- **A timeout is not a decline** (Day 19). When `authorize` throws you know you sent the request
+  but not whether the bank acted. The payment stays `PENDING`; `PENDING` already means "the
+  outcome is not known", so no fourth status was needed.
+- **`lookup` returning null means leave it alone.** A transient lookup failure is
+  indistinguishable from a genuine absence, so doing nothing is the correct reconciler outcome.
+- **The reconciler calls the existing `settle`**, not a copy. Two code paths that both write
+  ledger entries is how a ledger comes to disagree with itself.
+- **The outbox event commits with the payment** (Day 20). Publishing after commit leaves a window
+  where the payment settled and the event was never sent — which here means a merchant is never
+  told, so they don't ship, and nothing looks wrong.
+- **`published_at` nullable instead of a status column** — null means unpublished, a timestamp
+  means published, and you get *when* for free.
+- **`aggregate_id`, not `payment_id`** — the outbox doesn't know it holds payment events, so a
+  later refund or merchant event uses the same table. No FK, because a log shouldn't break
+  because a row was deleted elsewhere.
+- **Stamp `published_at` only after the broker confirms** — `send(...).get(10s)` with `acks: all`.
+  Stamping first would let a failed send look published, the exact loss the outbox prevents.
+- **Key Kafka records by `aggregateId`** — ordering is per partition, not per topic. Without a
+  key, records round-robin and a settled-then-refunded sequence could arrive backwards.
+- **A failed send breaks the sweep rather than skipping**, for the same ordering reason.
+- **At-least-once, knowingly.** If the send succeeds and the process dies before the stamp
+  commits, the next sweep republishes. Two systems can't be made atomic; sending twice beats
+  losing it.
+- **The event carries `merchantId`** so the consumer never queries the producer's database — a
+  consumer reading the producer's tables is exactly what events exist to avoid.
+- **The listener throws; the error handler owns retries.** `DefaultErrorHandler` +
+  `FixedBackOff(2000, 2)` + `DeadLetterPublishingRecoverer`. Retries must be **bounded** (one
+  record retrying forever blocks the partition) and failures must **not be dropped** (silence
+  means nobody knows) — a DLT satisfies both.
 - **Tests are integration tests, deliberately** — the interesting behaviour lives in the wiring.
+  The two unit tests exist because both pin behaviour that needs a dependency to **fail on
+  demand**, which a mock does cleanly and a real store does not.
+- **Decline rate is set explicitly in tests**, never left random. Random is a feature by hand and
+  a defect in CI.
 - **The schema is versioned, not inferred** — Flyway owns it, Hibernate only validates.
 - **API keys are split into a public prefix and a private hash** — you cannot look up a salted
   hash. An indexed prefix plus one SHA-256 comparison is constant time. Same shape as Stripe's
@@ -231,7 +339,7 @@ breaks every subsequent startup. The schema is wrong? Write V5.
 - **Shown once** — `Merchant.apiKey` is `@Transient`, serialised into the creation response
   and stored nowhere.
 - **Schema changes use expand/contract** — add nullable, dual-write, switch readers, then
-  enforce and drop.
+  enforce and drop. Writers switch **before** readers; `NOT NULL` belongs to contract.
 - **Page size is capped server-side** — without `max-page-size`, `?size=999999` is a supported
   request and pagination is decorative.
 - **The image is built in two stages** — Maven compiles in the first, only the JRE and the jar
@@ -261,6 +369,9 @@ page sorted by `createdAt` descending. The response is
 
 All authenticated endpoints are rate limited to 20 requests per merchant per minute.
 
+**There is no endpoint to set `webhook_url`.** It is set directly in the database:
+`UPDATE merchants SET webhook_url = '...' WHERE email = '...';`
+
 ---
 
 ## Gotchas already hit (don't repeat these)
@@ -288,30 +399,56 @@ All authenticated endpoints are rate limited to 20 requests per merchant per min
 **Config**
 
 - YAML forbids **duplicate keys** at one level — a second `spring:` silently drops the first
-- **A correctly-spelled YAML key in the wrong place is silently ignored**
-- New keys go **inside** existing blocks: `web:` is a sibling of `redis:` under `data:`
+- **A correctly-spelled YAML key in the wrong place is silently ignored.** Hit three times now:
+  `server.port` was nested inside `flyway:` **from Day 14 to Day 22** and never read at all —
+  invisible because Tomcat defaults to 8080 anyway and Render auto-detects the port. `spring.kafka`
+  was first pasted inside `jpa.properties.hibernate` and Hibernate ignored it silently. **A
+  misspelled key fails loudly; a misplaced one fails silently**, and a value that's correct by
+  accident looks identical to one that's correct by design.
+- New keys go **inside** existing blocks: `web:` is a sibling of `redis:` under `data:` —
+  but `kafka:` is a sibling of `datasource:` under `spring:`, and `outbox:` is top level.
 
 **JPA and Spring**
 
-- **Tables are plural** — `merchants`, `payments`, `ledger_entries`
+- **Tables are plural** — `merchants`, `payments`, `ledger_entries`, `idempotency_keys`,
+  `outbox_events`
 - **`ddl-auto: update` cannot add a NOT NULL column** to a populated table
 - **`save()` calls `merge()`, not `persist()`, when the entity already has an ID** — and
   `merge()` copies only *persistent* state onto a new instance. `@Transient` fields silently
   do not survive. Re-set them on the returned object.
-- **Self-invocation defeats Spring's proxies**
+- **`Payment.id` is application-assigned** (`UUID.randomUUID().toString()` in a field
+  initialiser), not `@GeneratedValue`. Tests that build a Payment by hand must set it.
+- **`@Enumerated(EnumType.STRING)` is load-bearing for the partial indexes.** Under the ORDINAL
+  default the status column would hold integers and `WHERE status = 'PENDING'` would match
+  nothing.
+- **A partial index is only used when the query's WHERE implies the index's.** A sweep query
+  without `status = 'PENDING'` silently gets a sequential scan.
+- **Self-invocation defeats Spring's proxies** — the reason `PaymentProcessor` is its own bean.
+- **Catching `DataIntegrityViolationException` inside the transactional method poisons it.**
+  Once a constraint fires the transaction is rollback-only. Catch in the controller.
+- **Narrow that catch without string-matching** — don't parse constraint names out of the
+  message. Ask the database whether the key is present now; if not, rethrow.
 - **Filters run before the DispatcherServlet**, so `@RestControllerAdvice` cannot catch what
   they throw — write the response by hand
-- **`@Transactional` rolls back Postgres, not Redis.** Test isolation is per-store.
+- **`@Transactional` rolls back Postgres, not Redis — and not a field on a singleton bean.**
+  `FakeBankClient`'s decision map survives between tests in the same context, so `reset()` in
+  `@BeforeEach` is required for the same reason `flushDb()` is.
 - **Serialising `Page` directly publishes `PageImpl`'s internals** as your API contract
 - **A `CommandLineRunner` that throws kills the application.** It runs *after* the context
   refreshes and Tomcat binds, so everything looks like it worked — then
   `SpringApplication.run` fails, closes the context and exits 1. Six lines of debug
   scaffolding that pinged Redis at startup cost three days of failed deploys.
+- **`@EnableScheduling` is required** or `@Scheduled` methods never run and nothing warns.
 
 **Security**
 
 - 401 = "who are you"; 403 = "not permitted"; 409 = "conflicts with current state";
   429 = "too fast"
+- **A 403 can hide a 500.** Spring Boot registers the security filter chain for the `ERROR`
+  dispatch too, while `OncePerRequestFilter.shouldNotFilterErrorDispatch()` returns true by
+  default — so the forward to `/error` arrives unauthenticated and `anyRequest().authenticated()`
+  denies it, overwriting the real status. **`.requestMatchers("/error").permitAll()` as the first
+  matcher.** Any app with a catch-all `authenticated()` rule needs it.
 - **jjwt 0.12 was a breaking release** — `verifyWith`/`parseSignedClaims` replaced the old API
 - **`hasRole("ADMIN")` looks for an authority literally named `ROLE_ADMIN`**
 - **`authorizeHttpRequests` is first-match-wins**, but `@GetMapping` resolves by pattern
@@ -322,6 +459,21 @@ All authenticated endpoints are rate limited to 20 requests per merchant per min
 - **A JSESSIONID on a 403 proves nothing on its own.** In Spring Security 6 the context is
   saved to a session when a filter *sets* an Authentication, so the cookie appears whether
   auth succeeded or failed. Don't read it as evidence either way.
+
+**Kafka**
+
+- **`apache/kafka:4.0.0` runs KRaft — there is no ZooKeeper service.** Tutorials showing one are
+  pre-4.x.
+- **Two listeners, because a broker hands clients its *advertised* address.** Containers reach it
+  at `kafka:29092`, the Mac at `localhost:9092`. One address can't serve both — get it wrong and
+  the client connects, is told to go somewhere unreachable, and **hangs** rather than erroring.
+- **Spring's dead-letter suffix is `-dlt`, lowercase** — the topic is `payment.settled-dlt`, not
+  `.DLT`. Worth knowing when you go looking for it.
+- **`@KafkaListener` connects to a real broker in tests.** Every `@SpringBootTest` starts it, so
+  with no broker the suite hangs. Fix: `spring.kafka.listener.auto-startup: false` in the test
+  profile. **Not done yet — CI is broken by this.**
+- **`acks: all` is what makes the confirmation meaningful.** Without it, `.get()` returns on a
+  send the broker may not have durably held.
 
 **Docker**
 
@@ -358,6 +510,17 @@ All authenticated endpoints are rate limited to 20 requests per merchant per min
 - **Both auth doors failing identically points downstream of both**, not at a coincidence in
   each. Testing the API-key path and the JWT path separately is what split the problem.
 - **`REDIS_PASSWORD` should be absent, not blank**, when internal authentication is off.
+- **The campus network blocks `*.aivencloud.com` at DNS**, including external resolvers. Test
+  with `nslookup` before assuming a managed service is misconfigured.
+
+**CI**
+
+- **`application-test.yaml` sets only the JDBC URL**, so username and password fall through to
+  `application.yaml`'s defaults. Postgres.app trusts local connections without a password;
+  the CI container demands one. A step-level `DB_PASSWORD` closes it.
+- **The runner's database is empty and the test profile sets `baseline-on-migrate: false`**, so
+  every push executes V1–V8 as real SQL. That's the proof the migrations work on a machine that
+  has never seen the project.
 
 **Terminal and workflow**
 
@@ -370,11 +533,14 @@ All authenticated endpoints are rate limited to 20 requests per merchant per min
   status line off the top.
 - **`curl -s ... | python3 -m json.tool` hides everything you need.** "Expecting value: line 1
   column 1" means the body was *empty*. Use `curl -i` with no pipe.
+- **Name your terminal tabs** when running three at once:
+  `echo -ne "\033]0;APP\007"`.
 - **A shell reads `~/.zshrc` once, at startup.** A tab opened before an alias was added won't
   know it. Cmd+T, or `source ~/.zshrc`.
 - **Paste one command at a time.** Pasting a block makes zsh interleave the output.
 - **Check the shell prompt before any relative path.**
 - **`lsof -ti :8080 | xargs kill`** before starting the app
+- **`git rm --cached a b` is atomic** — if one path isn't tracked, *neither* is removed.
 - **`git add` photographs a file at that instant.** Editing afterwards doesn't update the index.
 - **`cp` to a different filename case does nothing on macOS** — use `git mv`
 - **macOS numbers repeat downloads** — `ls -lt ~/Downloads/*.md | head -5` first.
@@ -385,51 +551,50 @@ All authenticated endpoints are rate limited to 20 requests per merchant per min
 
 ## What's next
 
-**Nothing is blocking.** Days 13 and 14 are complete, verified in production, documented and
-pushed. The tidy-up from that week is done too: the unused imports removed (`6f1fc81`), the
-stray `main` file deleted, and GitHub authentication moved from an expired HTTPS credential to
-an ed25519 SSH key — the remote is now `git@github.com:ARV0007/transakt.git`, which doesn't
-expire the way a Personal Access Token does.
+**Feature work is done.** Payment gateway, two auth doors, double-entry ledger, ownership,
+idempotency, rate limiting, bank simulator, two-transaction settlement, reconciler, outbox,
+Kafka publisher, webhook consumer with retries and a DLQ. 29 tests. All pushed.
 
-**Next:**
+**Known broken, fix first:**
 
-- **CI** — nineteen tests that run when someone remembers to run them. Nothing runs them on
-  push. This is the largest remaining gap in the project, and the thing that makes the test
-  suite load-bearing rather than ceremonial. A GitHub Actions workflow with Postgres and Redis
-  as service containers.
-- **The 403-that-should-be-a-500.** When Redis was unreachable, authenticated requests returned
-  an empty-bodied 403 rather than a 500 or a deliberate 503 — something catches the
-  `RedisConnectionException` and converts it. Find the catch, then decide deliberately whether
-  the rate limiter should **fail open or fail closed**. The answer differs for idempotency,
-  where failing open means charging a customer twice.
-- Kafka (payment events, webhook delivery with retries + DLQ), bank simulator,
-  Kubernetes as a deliberate exercise, Spring AI
+- **CI is red or hanging.** Every `@SpringBootTest` starts the `@KafkaListener` against
+  `localhost:9092` and the runner has no broker. Add `spring.kafka.listener.auto-startup: false`
+  to `application-test.yaml`, or add a Kafka service container to `.github/workflows/ci.yml`.
+  The first is better — the listener isn't what those tests are testing.
+- **Free Postgres expires 17 September 2026.** Decide before then: recreate it, migrate, or let
+  it go and treat Render as a demo that rebuilds from migrations.
 
-**Also outstanding:**
+**Then, in order of value:**
 
-- **The Redis failure surfaced as an empty-bodied 403, not a 500.** Something catches the
-  `RedisConnectionException` and converts it — `RateLimitFilter` sits upstream of
-  `ExceptionTranslationFilter`, so an uncaught throw should have escaped as a 500. Find the
-  catch. The design question underneath: when the rate limiter's store is unreachable, fail
-  open or fail closed? Different answer for idempotency, where failing open risks a double
-  charge.
-- `OwnershipIntegrationTest` survived the list endpoint changing from a JSON array to an
-  object, which means its assertions aren't structural.
-- **The API key prefix carries ~20 bits of entropy** — `tk_` eats three of eight characters.
-  Collisions become plausible near a thousand merchants.
-- **No foreign key constraints** — `merchantId` and `paymentId` are plain scalar columns.
+- Tests for `WebhookConsumer` and the dead-letter path — the only proof today is a manual run
+- An event id in the webhook payload so merchants can deduplicate an at-least-once delivery
+- Scheduled cleanup for published outbox rows and expired idempotency keys (two slow leaks)
+- `PATCH /api/v1/merchants/me` to set `webhook_url` through the API instead of psql
+- `SELECT ... FOR UPDATE SKIP LOCKED` or ShedLock, so the two schedulers survive a second instance
+
+**Smaller, still outstanding:**
+
+- `POST /api/v1/merchants` returns 200, not 201; no password-change endpoint;
+  no `Retry-After` header on 429s
 - **Signup accepts a merchant with no password**, which can then never log in. `@NotBlank`.
 - Unauthenticated traffic isn't rate limited; no IP-based limiter
 - Fixed-window rate limiting allows a boundary burst
 - Idempotency keys aren't fingerprinted against the request body (Stripe returns 422)
+- The idempotency race path is untested — the test class is `@Transactional`, so a constraint
+  violation would poison its own transaction
 - Offset pagination degrades with depth; cursors are the standard fix
-- `POST /api/v1/merchants` returns 200, not 201; no password-change endpoint;
-  no `Retry-After` header on 429s
+- **Only one FK constraint exists** (`idempotency_keys.payment_id`); everything else is scalar
+- **The API key prefix carries ~20 bits of entropy** — `tk_` eats three of eight characters
+- `OwnershipIntegrationTest` survived the list endpoint changing shape, so its assertions
+  aren't structural
 - A Spring Security warning about a generated password and an `inMemoryUserDetailsManager`
   appears at startup — harmless, but odd for an app with its own two auth doors. Unexamined.
+- Five Redis repository-scanning WARNs on every boot, because `spring-boot-starter-data-redis`
+  tries to claim the JPA repositories. Fixable with one annotation.
 - **Flyway warns that PostgreSQL 18.4 is newer than it officially supports.** It validated
   everything anyway. Wants a Flyway bump eventually, not a Postgres downgrade.
-- **Free Postgres expires 17 September 2026.** Calendar it with a week's warning.
+- **Dependency CVEs are unaudited.** Spring Boot 3.4.1 pulls transitive versions with known
+  advisories; fixing means a parent bump with its own testing.
 
 ---
 
@@ -437,7 +602,7 @@ expire the way a Personal Access Token does.
 
 - `docs/notes.md` — concept explanations, the "why" behind everything
 - `docs/WORKLOG.md` — daily entries: Built / Why / Concepts / Interview line / Mistake & fix
-- `docs/architecture.md` — versioned architecture with Mermaid diagrams, currently **v1.3**:
+- `docs/architecture.md` — versioned architecture with Mermaid diagrams, currently **v1.6**:
   a deployment topology diagram plus the application internals
 - `docs/UNDERSTANDING.md` — from-scratch primer: what a gateway is, HTTP and Postman from
   zero, credentials explained, day-by-day reasoning, interview narrative, deployment roadmap

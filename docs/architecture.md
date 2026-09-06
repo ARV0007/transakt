@@ -1,12 +1,12 @@
 # Transakt Architecture
 
-## Current: v1.5 — the bank seam (Days 13–18)
+## Current: v1.6 — the event pipeline (Days 13–22)
 
 **Live at https://transakt.onrender.com**
 
 ### Deployment topology
 
-````mermaid
+`````mermaid
 flowchart TD
   client[Merchant server or dashboard]
   client -->|HTTPS| edge[Render edge - Cloudflare - TLS terminates here]
@@ -14,17 +14,18 @@ flowchart TD
   app -->|private network - no TLS needed| pg[(transakt-db - PostgreSQL 18 - Singapore)]
   app -->|private network - no TLS needed| kv[(transakt-redis - Valkey 8 - Singapore)]
   gh[GitHub ARV0007/transakt - branch main] -->|Auto-Deploy on push| build[Render build - multi-stage Dockerfile]
-  gh -->|push or pull request| ci[GitHub Actions - twenty-two tests against service containers]
+  gh -->|push or pull request| ci[GitHub Actions - twenty-nine tests - no Kafka broker, see limitations]
   build --> app
-  flyway[Flyway V1-V5 - runs at container startup, before Hibernate validates] -.-> pg
-````
+  flyway[Flyway V1-V8 - runs at container startup, before Hibernate validates] -.-> pg
+  note[Kafka is NOT deployed - it runs only in docker-compose locally] -.-> app
+`````
 
 All three services sit in the same region because Render's private networking is per-region — an
 internal hostname resolves only from inside it. The public internet reaches exactly one of them.
 
 ### Application internals
 
-````mermaid
+`````mermaid
 flowchart TD
   server[Merchant server - a machine]
   human[Merchant dashboard - a human]
@@ -39,39 +40,32 @@ flowchart TD
   rlf -->|over limit - 429| reject[Request stops here]
   rlf --> dispatcher[DispatcherServlet]
   dispatcher --> ac[AuthController - open]
-  dispatcher --> health[HealthController - open]
   dispatcher --> mc[MerchantController - POST open, rest ADMIN only]
-  dispatcher --> pc[PaymentController - identity from SecurityContext, idempotency lookup and race recovery]
+  dispatcher --> pc[PaymentController - idempotency lookup and race recovery]
   dispatcher -.->|exceptions| geh[GlobalExceptionHandler - 400 401 404]
   tomcat -.->|unhandled 500 forwarded| err[/error - permitAll, or its own denial masks the real status/]
-  pc --> idem[IdempotencyService - one lookup by merchant plus key]
-  pc -->|writes| proc[PaymentProcessor - runs the three steps, holds no transaction of its own]
-  pc -->|reads| ps[PaymentService - ownership checks, scoped queries]
-  proc -->|transaction 1| pend[PaymentService.createPending - payment row as PENDING plus the idempotency key]
-  proc -->|NO transaction held - 200 to 800ms| bank[BankClient - the port]
-  bank --> fake[FakeBankClient - configurable latency and decline rate]
-  proc -->|transaction 2| settle[PaymentService.settle - final status, ledger entries only when approved]
-  rlf --> rate[RateLimitService - INCR plus TTL]
-  rate --> redis[(Redis or Valkey - rate counters only)]
-  ac --> as[AuthService]
-  as --> js[JwtService]
-  as --> pe[PasswordEncoder - BCrypt]
-  mc --> ms[MerchantService]
-  ms --> mr[MerchantRepository]
-  ps --> pr[PaymentRepository - findByMerchantId returns a Page]
-  pend --> pr
-  pend --> ikr[IdempotencyKeyRepository - written inside transaction 1]
-  settle --> pr
-  settle --> lr[LedgerEntryRepository - two balancing rows, approved only]
-  idem --> ikr
-  mr --> db[(PostgreSQL)]
-  pr --> db
-  lr --> db
-  ikr --> db
-  flyway[Flyway V1-V5 - runs once at startup, before Hibernate validates] -.-> db
-````
+  pc -->|writes| proc[PaymentProcessor - three steps, holds no transaction itself]
+  proc -->|transaction 1| pend[createPending - PENDING row plus idempotency key]
+  proc -->|NO transaction held - 200 to 800ms| bank[BankClient - authorize and lookup]
+  bank --> fake[FakeBankClient - latency, decline rate, remembers its decisions]
+  proc -->|transaction 2| settle[settle - final status, ledger entries if approved, outbox event ALWAYS]
+  settle --> oer[(outbox_events - published_at null)]
+  sched1[PaymentReconciler - every 60s] -->|PENDING older than 5 min| bank
+  sched1 --> settle
+  sched2[OutboxPublisher - every 5s] -->|reads unpublished| oer
+  sched2 -->|send, keyed by paymentId, acks=all| topic[[payment.settled]]
+  sched2 -->|stamp published_at AFTER confirmation| oer
+  topic --> wc[WebhookConsumer - KafkaListener, group transakt-webhooks]
+  wc -->|POST| merchant[Merchant webhook_url]
+  wc -.->|3 attempts, 2s apart, then give up| dlt[[payment.settled-dlt]]
+  rlf --> redis[(Redis or Valkey - rate counters only)]
+  pend --> db[(PostgreSQL)]
+  settle --> db
+  oer --> db
+  flyway[Flyway V1-V8 - runs once at startup, before Hibernate validates] -.-> db
+`````
 
-**How a request flows:** Tomcat parses the HTTP request. Three filters run before any controller. `JwtAuthFilter` looks for an `Authorization: Bearer` header and, if the signature verifies and the token has not expired, records the caller's merchant ID and role in the SecurityContext with no database access. `ApiKeyFilter` then looks for `X-API-Key` and, if the context is still empty, takes the key's first eight characters as a lookup prefix, finds the single matching merchant row through a unique index, and compares the SHA-256 of the whole key against the stored hash before recording the same identity. `RateLimitFilter` runs last of the three — deliberately, because it needs an identity to count against — and refuses the request outright with 429 if that merchant has exceeded its per-minute allowance. The DispatcherServlet then routes to a controller. Controllers read the caller's identity from the SecurityContext and hand services plain values, so services stay free of Spring Security types. Creating a payment is no longer one transaction: `PaymentProcessor` opens one to record the attempt, closes it, calls the bank, then opens a second to record the outcome. Each half is still atomic — the payment row and its idempotency key together, then the final status and both ledger entries together — but the two halves are not atomic with each other, and that is deliberate.
+**How a request flows:** Tomcat parses the HTTP request. Three filters run before any controller. `JwtAuthFilter` looks for an `Authorization: Bearer` header and, if the signature verifies and the token has not expired, records the caller's merchant ID and role in the SecurityContext with no database access. `ApiKeyFilter` then looks for `X-API-Key` and, if the context is still empty, takes the key's first eight characters as a lookup prefix, finds the single matching merchant row through a unique index, and compares the SHA-256 of the whole key against the stored hash before recording the same identity. `RateLimitFilter` runs last of the three — deliberately, because it needs an identity to count against — and refuses the request outright with 429 if that merchant has exceeded its per-minute allowance. The DispatcherServlet then routes to a controller. Controllers read the caller's identity from the SecurityContext and hand services plain values, so services stay free of Spring Security types. Creating a payment is no longer one transaction: `PaymentProcessor` opens one to record the attempt, closes it, calls the bank, then opens a second to record the outcome. Each half is still atomic — the payment row and its idempotency key together, then the final status, both ledger entries and the outbox event together — but the two halves are not atomic with each other, and that is deliberate.
 
 **The bank seam, and why one transaction became two (v1.5):** payments now go through an acquiring bank. `BankClient` is an interface; `FakeBankClient` implements it with a configurable latency between two hundred and eight hundred milliseconds and a configurable decline rate. Nothing above the interface knows that today's implementation flips a weighted coin, which is the whole reason for putting it there — a real acquirer is a second adapter behind the same port rather than a rewrite of the payment path.
 
@@ -85,39 +79,85 @@ That processor is a separate bean rather than a third method on `PaymentService`
 
 **Payment status is a state machine now (v1.5):**
 
-````mermaid
+`````mermaid
 stateDiagram-v2
   [*] --> PENDING: createPending - transaction 1
   PENDING --> CAPTURED: settle - bank approved - two ledger entries written
-  PENDING --> DECLINED: settle - bank declined - no ledger entries
+  PENDING --> FAILED: settle - bank declined - no ledger entries
   note right of PENDING
     A process that dies between the two
     transactions strands a payment here.
-    Nothing sweeps these up.
+    PaymentReconciler sweeps these (v1.6).
   end note
-````
+`````
 
-**What the split costs.** Atomicity was doing real work and now it is not. One transaction meant a payment either fully existed or fully did not. Two means there is an observable state in between: a row at `PENDING` with no outcome recorded. That gap cannot be closed by rearranging code. It is the price of not blocking, and every real payment system pays it. The standard answer is a reconciliation job that sweeps `PENDING` rows past some age, asks the bank what actually happened, and settles them. **This one does not have one.**
+**What the split costs.** Atomicity was doing real work and now it is not. One transaction meant a payment either fully existed or fully did not. Two means there is an observable state in between: a row at `PENDING` with no outcome recorded. That gap cannot be closed by rearranging code. It is the price of not blocking, and every real payment system pays it. The standard answer is a reconciliation job that sweeps `PENDING` rows past some age, asks the bank what actually happened, and settles them. Since v1.6 this one has it.
 
-It is also the first honest motivation for Kafka this project has had. Once the outcome legitimately arrives separately from the request, publishing an event and letting a consumer drive settlement stops being a resume line and becomes the obvious shape of the problem.
+It is also what gave Kafka an honest motivation. Once the outcome legitimately arrives separately from the request, publishing an event and letting a consumer act on it stops being a resume line and becomes the obvious shape of the problem — realised in v1.6.
 
-**One artifact, three environments (v1.3):** every external address in `application.yaml` is now `${VAR:sensible-default}` — database host, name, user and password; Redis host, port and password; the HTTP port; the JWT secret; the rate limit. The same jar and the same image run on a MacBook, inside docker-compose, and in Singapore. Only the environment differs.
+**Reconciling what the bank never answered (v1.6):** Day 18's write-up called the stranded `PENDING` payment a crash scenario. Reading the code showed that was too generous. `bankClient.authorize` was not wrapped in a try/catch, so any exception — timeout, connection reset — propagated out of `process`, past `settle`, to the caller as a 500. But `createPending` had **already committed**. Stranding was not rare; it was the ordinary behaviour of a bank timeout.
 
-The defaults are not laziness, they are the thing that keeps local development at zero setup: with no variables set at all, the app looks for Postgres and Redis on localhost, which is exactly where they are on the development machine. Compose overrides the hosts with service names. Render overrides them with managed hostnames. Nothing branches on an environment name, and there is no `application-prod.yaml` — a profile would be a fourth thing to keep in sync, and every value it would hold is already a variable.
+Worse, the idempotency key made it unrecoverable: a retry carrying the same key returns the stranded payment rather than starting a fresh attempt. **The mechanism that prevents double charges also prevented recovery.**
 
-`server.port: ${PORT:8080}` sits at the top level as a sibling of `spring:`, because the platform decides which port to route to and tells the container. Binding a hardcoded port is a contract the platform never agreed to.
+`BankClient` gained a second method, `lookup(paymentId)`, and `PaymentReconciler` is a `@Scheduled` sweep that finds `PENDING` payments older than five minutes, asks the bank what happened, and hands the answer to the **existing** `settle`. Not a copy of the settlement logic — the same method the happy path uses. Two code paths that both write ledger entries is how a ledger comes to disagree with itself.
+
+Three decisions inside it are worth naming. The catch on `authorize` returns the payment untouched rather than marking it `FAILED`: when the call throws you know the payment exists and you sent it, but **not** whether the bank acted, and recording a timeout as failure would tell a merchant nothing happened while the customer's money may already be gone. `lookup` returning null means the bank has no record, and the sweeper leaves the payment alone — doing nothing is a valid outcome for a reconciler, because a transient lookup failure is indistinguishable from a genuine absence. And no fourth status was needed: `PENDING` already means *the outcome is not known*, which is exactly true whether the call hasn't happened or blew up.
+
+`V6__add_pending_payments_index.sql` supports the sweep with a **partial index**: `ON payments (created_at) WHERE status = 'PENDING'`. Postgres indexes only matching rows, so it stays the size of the stuck backlog rather than the table. The catch is that Postgres uses it only when the query's WHERE implies the index's — a query without `status = 'PENDING'` silently gets a sequential scan. This only works because `@Enumerated(EnumType.STRING)` stores the literal text; under the ORDINAL default the column would hold integers and the predicate would match nothing.
+
+**The outbox: events that cannot be lost (v1.6).** When a payment settles, someone needs telling. The naive answer is to publish to Kafka after the transaction commits — and it leaves a window where the payment is settled and the event was never sent. For most systems that's an acceptable risk. Here the event drives **webhook delivery to the merchant**: a lost event means a merchant is never told their payment settled, so they don't ship, the customer has been charged, and nothing in the system looks wrong. That is the same failure the reconciler was built to eliminate, arriving through a different door.
+
+So `V7__add_outbox_events.sql` creates a table and `settle` writes a row into it **inside its own transaction**, alongside the payment and its ledger entries. Either both commit or neither does.
+
+The table has no `status` column. `published_at` is nullable: null means unpublished, a timestamp means published, and you get *when* for free. `aggregate_id` rather than `payment_id`, because the table does not know it holds payment events — `event_type` says which kind, and a later refund or merchant event uses the same mechanism. No foreign key to `payments`, because an outbox is a log of things that happened and a log should not break because a row was deleted elsewhere. A second partial index covers `created_at WHERE published_at IS NULL`, same reasoning as V6.
+
+**Publishing (v1.6):** `OutboxPublisher` is a `@Scheduled(fixedDelayString = "PT5S")` sweep — the same shape as the reconciler, pointed at a different table. It reads unpublished rows oldest-first, sends each payload to the `payment.settled` topic, and stamps `publishedAt`.
+
+Deliberately **not** `@Transactional`: the send is an external call, and holding a pooled connection across one is the mistake Day 18 fixed.
+
+Three properties carry the weight.
+
+*The stamp happens only after the broker confirms.* `send(...).get(10s)` waits, and `acks: all` means that confirmation is a durable one. Stamping first would let a failed send look published — the exact loss the outbox exists to prevent.
+
+*Records are keyed by `aggregateId`.* Kafka guarantees ordering within a partition, not across a topic. Keying by payment id puts every event for one payment on the same partition, so a settled-then-refunded sequence can never arrive backwards. Without a key, records round-robin and ordering is gone.
+
+*A failed send stops the sweep rather than skipping.* Continuing past a failure would publish later events before earlier ones, defeating the key. The row stays unpublished whatever went wrong, and the next sweep retries.
+
+The honest limit is **at-least-once**. If the send succeeds but the process dies before the stamp commits, the next sweep publishes again. Two systems cannot be made atomic; you choose which side to fail on, and sending twice beats losing it. Consumers must tolerate duplicates.
+
+**Webhook delivery (v1.6):** `WebhookConsumer` is a `@KafkaListener` on `payment.settled`, consumer group `transakt-webhooks`. It reads `merchantId` from the payload, looks up the merchant's `webhook_url` (`V8`, nullable — a merchant without one is simply not called), and POSTs the payload.
+
+`merchantId` was added to the event payload for this. The consumer could have queried the payments table, but a consumer reading the producer's database is exactly what events exist to avoid. **An event carries everything its consumer needs.**
+
+This is where Kafka stops being demonstrative. A merchant's endpoint is a third party that can be slow or down, and calling it inline would put their uptime on the payment request path — the same mistake as an unguarded bank call, one layer further out. On a consumer thread, a merchant whose server is dead blocks nothing.
+
+**The listener throws on failure on purpose.** `KafkaConfig` registers a `DefaultErrorHandler` with `FixedBackOff(2000, 2)` and a `DeadLetterPublishingRecoverer`: three attempts two seconds apart, then the record is republished to **`payment.settled-dlt`** (Spring's default suffix is `-dlt`, lowercase). The listener is written as if delivery always succeeds; the error handler owns the failure policy.
+
+Two properties pull against each other and the dead letter satisfies both. Retries must be **bounded**, because Kafka delivers a partition in order and one record retrying forever stops every other merchant behind it. Failures must **not be dropped**, because giving up silently means nobody knows. So: give up after three attempts, but give up into a place you can look at. A DLT with records in it is an alert; a DLT you can replay is a recovery plan.
+
+**Verified end to end, 6 Sep 2026.** A payment created through the API produced an event on `payment.settled` keyed by the payment id. With the merchant's `webhook_url` pointed at a server that rejects POST, the retries ran and `payment.settled-dlt` was created.
+
+**Kafka runs in compose, not on Render (v1.6).** Render offers no managed Kafka on any tier, and the development network blocks `*.aivencloud.com` at DNS — including external resolvers, so an Aiven cluster was unreachable. Kafka moved into `docker-compose.yml` as `apache/kafka:4.0.0` in **KRaft mode**: no ZooKeeper, one container acting as both broker and controller. Most tutorials still show a separate `zookeeper` service; that is the pre-4.x architecture.
+
+The configuration detail that matters is **two listeners**. Containers on the compose network reach the broker at `kafka:29092`; the Mac reaches it at `localhost:9092`. A broker hands clients its *advertised* address, so one address cannot serve both — get it wrong and the client connects, is told to go somewhere it cannot reach, and hangs. The consequence for deployment is that the live Render instance has no broker: `OutboxPublisher` runs there and finds nothing to send, because nothing settles without a Kafka to publish to. **The event pipeline is currently a local-only capability.**
+
+**One artifact, three environments (v1.3):** every external address in `application.yaml` is now `${VAR:sensible-default}` — database host, name, user and password; Redis host, port and password; the Kafka bootstrap servers; the HTTP port; the JWT secret; the rate limit. The same jar and the same image run on a MacBook, inside docker-compose, and in Singapore. Only the environment differs.
+
+The defaults are not laziness, they are the thing that keeps local development at zero setup: with no variables set at all, the app looks for Postgres, Redis and Kafka on localhost, which is exactly where they are on the development machine. Compose overrides the hosts with service names. Render overrides them with managed hostnames. Nothing branches on an environment name, and there is no `application-prod.yaml` — a profile would be a fourth thing to keep in sync, and every value it would hold is already a variable.
+
+`server.port: ${PORT:8080}` sits at the top level as a sibling of `spring:`, because the platform decides which port to route to and tells the container. Binding a hardcoded port is a contract the platform never agreed to. Worth recording that this key was **nested inside `flyway:` from Day 14 until Day 22** and therefore never read at all — invisible because Tomcat defaults to 8080 anyway and Render's port auto-detection covered for it. A misspelled YAML key fails loudly; a misplaced one fails silently, and a value that is correct by accident looks identical to one that is correct by design.
 
 **Containerised (v1.3):** the `Dockerfile` is multi-stage. The first stage is `maven:3.9-eclipse-temurin-21` and produces the jar; the second is `eclipse-temurin:21-jre` and runs it. The build needs Maven, a full JDK and roughly two hundred megabytes of downloaded dependencies; the runtime needs a JRE and one jar. Shipping the first to production means shipping a compiler and a package manager to a machine that should only execute code.
 
 Instruction order inside the build stage is a design decision rather than a formatting one. `COPY pom.xml` and `mvn dependency:go-offline` come before `COPY src`, because Docker caches each instruction and invalidates everything beneath the first change. With the source copied first, a one-character edit re-downloads every dependency. Split, that layer took 154.9 seconds once and has taken zero since.
 
-`docker-compose.yml` runs three services — `postgres:18`, `redis:8-alpine` and the app. Two details matter. Service names are hostnames inside the compose network, so the app reaches the database at `postgres`; `localhost` inside a container means *that container*, not the host. And `depends_on` alone is not enough, because it waits for the container to exist rather than for Postgres to accept connections — the app boots in three seconds and would lose that race routinely. Healthchecks with `condition: service_healthy` are load-bearing. Only Postgres gets a named volume; Redis deliberately doesn't, because everything in it has a TTL and is meant to expire. Only the app publishes a port, which keeps the data stores invisible to the host and avoids colliding with Postgres.app on 5432.
+`docker-compose.yml` runs four services since v1.6 — `postgres:18`, `redis:8-alpine`, `apache/kafka:4.0.0` and the app. Two details matter. Service names are hostnames inside the compose network, so the app reaches the database at `postgres`; `localhost` inside a container means *that container*, not the host. And `depends_on` alone is not enough, because it waits for the container to exist rather than for Postgres to accept connections — the app boots in three seconds and would lose that race routinely. Healthchecks with `condition: service_healthy` are load-bearing. Only Postgres gets a named volume; Redis and Kafka deliberately don't, because their contents are development scratch. Only the app and Kafka publish ports, which keeps the data stores invisible to the host and avoids colliding with Postgres.app on 5432.
 
 The first containerised run was also the clearest proof of Day 12a's value: V1 through V4 applied as real SQL against a completely empty Postgres that had never seen this project, with no baselining, on infrastructure nobody had configured.
 
 **Deployed (v1.3):** Render, free tier, three resources — a Docker web service, managed PostgreSQL 18, and a managed Key Value store. That last one runs **Valkey 8**, the fork created after Redis changed its licence; it is wire-compatible, so Lettuce and Spring Data Redis needed no changes at all.
 
-Auto-Deploy watches `main` on GitHub and rebuilds on push, which means the deployed artifact is whatever is *pushed* rather than whatever is saved locally — a distinction that cost a day. Flyway is what makes redeployment cheap: the schema builds itself from five migration files on any database, so a fresh instance needs no manual SQL and losing the free Postgres to expiry costs demo data rather than the ability to run.
+Auto-Deploy watches `main` on GitHub and rebuilds on push, which means the deployed artifact is whatever is *pushed* rather than whatever is saved locally — a distinction that cost a day. Flyway is what makes redeployment cheap: the schema builds itself from eight migration files on any database, so a fresh instance needs no manual SQL and losing the free Postgres to expiry costs demo data rather than the ability to run.
 
 Two properties of the free tier are worth stating rather than discovering. The web service spins down after fifteen minutes idle, and the first request afterwards has been measured at **over two minutes**, not the fifty seconds advertised — so a link shared for review needs that caveat attached. And the managed Postgres expires thirty days after creation, with a fourteen-day grace period.
 
@@ -127,13 +167,15 @@ One asymmetry is worth auditing rather than inheriting: the managed Postgres shi
 
 **Continuous integration (Day 15):** `.github/workflows/ci.yml` runs the full suite on every push and every pull request to `main`. The runner starts `postgres:18` and `redis:8-alpine` as health-checked service containers, sets up Temurin 21 with a cached Maven repository, and runs `./mvnw test` — roughly seventy seconds, green on the first run. The one real catch was invisible until both config files were read against each other: `application-test.yaml` sets only the JDBC URL, so username and password fall through to `application.yaml`'s defaults, and Postgres.app trusts local connections without a password while the container demands one. A step-level `DB_PASSWORD` closes it.
 
-What CI proves goes beyond the assertions. The runner's database is empty and the test profile sets `baseline-on-migrate: false`, so V1 through V5 execute as real SQL on every push and Hibernate then validates the result against the entity mappings. **Every push is a proof that the migrations build a working schema on a machine that has never seen this project.**
+What CI proves goes beyond the assertions. The runner's database is empty and the test profile sets `baseline-on-migrate: false`, so V1 through V8 execute as real SQL on every push and Hibernate then validates the result against the entity mappings. **Every push is a proof that the migrations build a working schema on a machine that has never seen this project.**
+
+**CI is currently broken by v1.6 and this is known.** Every `@SpringBootTest` now starts the `@KafkaListener`, which connects to `localhost:9092`. The runner has Postgres and Redis service containers but no Kafka, so the suite will hang or fail there. The fix is `spring.kafka.listener.auto-startup: false` in the test profile — the listener is not what those tests are testing, and starting it makes twenty-nine tests depend on infrastructure that only one of them cares about.
 
 **A 403 can hide a 500 (Day 16):** with Redis unreachable, every authenticated request returned an empty-bodied 403 — which reads as a permissions problem and is not one. Nothing was catching the `RedisConnectionFailureException`. Tomcat set 500 and dispatched internally to `/error`, and because Spring Boot registers the security filter chain for the `ERROR` dispatch as well — while `OncePerRequestFilter.shouldNotFilterErrorDispatch()` returns true by default, so the custom filters skip it — that dispatch arrived unauthenticated and `anyRequest().authenticated()` denied it. **The error page, whose entire job is reporting failures, was failing its own permissions check, and its 403 overwrote the real status.** `.requestMatchers("/error").permitAll()` as the first matcher fixes it. Any application with a catch-all `authenticated()` rule needs that line, or every unhandled exception surfaces as an authorization failure.
 
 **Schema is versioned, not inferred (v1.2):** the database shape is now defined by numbered SQL migrations in `db/migration` rather than derived from the entity classes at startup. Hibernate runs in `validate` mode — it compares entities against the schema and refuses to start on a mismatch, but never builds anything. All construction is Flyway's. This closes a real gap: `ddl-auto: update` cannot add a `NOT NULL` column to a populated table, so the fix on Day 8 was a hand-run `ALTER TABLE` that existed only on one laptop and was recorded nowhere. Every schema change is now a reviewable file with a checksum, replayable on any machine. Flyway runs inside application startup, which means a failed boot performs no migration at all and leaves the database exactly as it was.
 
-The existing development database was **baselined** rather than rebuilt: `baseline-on-migrate` writes a marker row and skips everything at or below version 1, because those tables already existed. The test database, created empty, runs V1 for real — making `./mvnw test` the only place the initial migration actually executes, and therefore the proof that it is correct. The test profile deliberately sets `baseline-on-migrate: false`, so a test database left in an unexpected state fails the build loudly rather than silently baselining and skipping a migration.
+The existing development database was **baselined** rather than rebuilt: `baseline-on-migrate` writes a marker row and skips everything at or below version 1, because those tables already existed. The test database, created empty, runs V1 for real — making `./mvnw test` the only place the initial migration actually executes, and therefore the proof that it is correct. The test profile deliberately sets `baseline-on-migrate: false`, so a test database left in an unexpected state fails the build loudly rather than silently baselining and skipping a migration. A side effect worth knowing: the dev database reports one more migration than the test database, because the baseline marker counts.
 
 **Collections are paginated (v1.2):** `GET /api/v1/payments` returns a page rather than every matching row — twenty by default, newest first, with a server-enforced ceiling of one hundred. Without that cap the parameter is a suggestion rather than a protection, since a client could simply ask for a million. Spring Data rewrites the query to add `LIMIT`/`OFFSET`, and the resulting `WHERE merchant_id = ? ORDER BY created_at DESC` is exactly what the index added in the same day's first migration was built for. The response is serialised through `PagedModel` rather than as a raw `PageImpl`, because `PageImpl`'s field layout is a framework implementation detail and publishing it would make a library refactor a breaking API change. The known ceiling is offset depth: `OFFSET 100000` makes Postgres walk and discard a hundred thousand rows, which is why cursor-based pagination exists.
 
@@ -143,23 +185,35 @@ SHA-256 rather than BCrypt is deliberate. Slow hashing defends against guessable
 
 The migration was performed as **expand and contract** across four steps: add the columns nullable and backfill them, start writing them on every signup, switch the reader, then enforce `NOT NULL` and drop the old column. Between the first and last step the database supported both shapes, so no intermediate state could lose data, and the only irreversible step was last and isolated. Two orderings inside that sequence are easy to get backwards and both matter: writers must switch before readers, or a merchant created in between has a key but no hash; and `NOT NULL` belongs to the contract phase, because during expand the entity does not yet map the columns and every insert would write null.
 
-**The test suite (v1.1, twenty-two tests since v1.5):** twenty-one integration tests plus one unit test, running against the full stack in about twenty seconds. `AuthIntegrationTest` covers signup, login and both failure paths. `OwnershipIntegrationTest` covers foreign payments and ledgers returning 404, list scoping, and the forged `merchantId` being ignored. `IdempotencyIntegrationTest` covers key reuse, key scoping per merchant, and the deliberate decision not to fingerprint the request body. `RateLimitIntegrationTest` covers the 429 threshold and the fact that one merchant hitting the ceiling does not affect another. All use `MockMvc`, which sends real requests through the entire filter chain and into a real database without opening a network port.
+**The test suite (v1.1, twenty-nine tests since v1.6):** twenty-seven integration tests plus two unit tests, running against the full stack in about forty seconds. `AuthIntegrationTest` covers signup, login and both failure paths. `OwnershipIntegrationTest` covers foreign payments and ledgers returning 404, list scoping, and the forged `merchantId` being ignored. `IdempotencyIntegrationTest` covers key reuse, key scoping per merchant, and the deliberate decision not to fingerprint the request body. `RateLimitIntegrationTest` covers the 429 threshold and the fact that one merchant hitting the ceiling does not affect another. All use `MockMvc`, which sends real requests through the entire filter chain and into a real database without opening a network port.
 
 All five idempotency tests passed **unchanged** through the v1.4 rewrite, while the entire storage layer beneath them was replaced. That is the payoff for testing through the front door rather than mocking the service: the tests describe the contract, so they survive any implementation that still honours it.
 
-`RateLimitServiceTest` is the exception that proves the rule — the project's only unit test, and correct precisely because the behaviour it covers is a single catch block. Exercising it requires Redis to fail *on demand*, which a mocked `StringRedisTemplate` does cleanly and a real one does not. Test at the level where the behaviour actually lives.
+`RateLimitServiceTest` is the exception that proves the rule — the project's first unit test, and correct precisely because the behaviour it covers is a single catch block. Exercising it requires Redis to fail *on demand*, which a mocked `StringRedisTemplate` does cleanly and a real one does not. Test at the level where the behaviour actually lives.
 
-Day 18 added two tests pinning the payment state machine: an approved payment ends `CAPTURED` with two balancing ledger entries, a declined one ends `DECLINED` with none. Both set `FakeBankClient`'s decline rate explicitly — zero or one hundred — rather than letting it randomise. **A random decline rate is a feature by hand and a defect in CI.** Exploring manually, it shows you both branches without touching config. In a pipeline it makes a red build mean nothing, and a test that flips a coin trains you to re-run CI instead of reading it.
+Day 18 added two tests pinning the payment state machine: `ApprovedPaymentIntegrationTest` asserts a payment ends `CAPTURED` with two balancing ledger entries, `DeclinedPaymentIntegrationTest` that it ends `FAILED` with none. Both set `FakeBankClient`'s decline rate explicitly — zero or one hundred — rather than letting it randomise. **A random decline rate is a feature by hand and a defect in CI.** Exploring manually, it shows you both branches without touching config. In a pipeline it makes a red build mean nothing, and a test that flips a coin trains you to re-run CI instead of reading it.
+
+Days 19–21 added three more classes. `ReconcilerIntegrationTest` pins both sweeper outcomes, and the second is the one that earns its place: when the bank has no record, the payment must be left **completely alone** — status unchanged, ledger empty, count zero. Three positive assertions about absence, because "no exception was thrown" would pass against a reconciler that deleted the row. It guards the change someone will genuinely want to make: closing stuck rows as `FAILED` looks like housekeeping in a diff and is the most expensive bug a gateway can ship.
+
+`OutboxIntegrationTest` asserts that settling writes exactly one event, on both branches. `hasSize(1)` rather than `isNotEmpty()`, because the transaction rolls back between tests and a duplicate would otherwise pass unnoticed.
+
+`OutboxPublisherTest` is the project's second unit test, and a unit test for the same reason as the first: the rule worth pinning is *stamp only after the broker confirms*, and proving it requires the send to **fail on demand**, which a mocked `KafkaTemplate` does cleanly and a real broker does not.
+
+Two things are unpinned by design and both should be. `WebhookConsumer` has no test, and neither does the dead-letter path — the proof is a manual run, and manual runs do not execute in CI.
 
 **Why integration rather than unit tests (v1.1):** almost everything interesting in this system lives in the wiring — a three-filter chain, first-match-wins path rules, ownership checks that depend on who authenticated, idempotency and rate limiting that depend on external stores. A unit test of `PaymentService` with mocked repositories would pass happily while `SecurityConfig` was wide open, because it never touches a filter. Testing through the front door is what makes the security model verifiable at all. The tests worth having are the ones guarding failures that would be **silent** in production: removing `@JsonProperty(WRITE_ONLY)` from the password field, changing one login error message and reopening email enumeration, adding `merchantId` back to the request DTO, or dropping the merchant ID out of an idempotency or rate-limit key. Each is a one-word change that looks harmless in a diff.
 
 The clearest evidence arrived on Day 12. Making `apiKey` transient caused signup to return null, because Spring Data calls `merge()` rather than `persist()` for an entity whose ID is already assigned — and `merge()` copies only persistent state onto a new instance. The failure surfaced in a test written on Day 11 to check something entirely unrelated: that signup never leaks the password hash. A test's value is not the bugs it catches on the day it is written.
 
-**Test isolation is per-store (v1.1, updated v1.4):** the `test` profile points at a separate `transakt_test` database. It no longer uses `create-drop` — the schema is now built by the same Flyway migrations that build production, under `ddl-auto: validate`, which is a stronger check: it verifies that the migrations and the entity mappings genuinely agree. `@Transactional` on each test class rolls back after every test, so tests cannot see each other's data. That rollback now covers idempotency keys too, since they are rows in Postgres — only `RateLimitIntegrationTest` still flushes Redis in `@BeforeEach`, because counters survive a database rollback. Tests use Redis database 1 while the application uses 0 — sixteen numbered databases share one server with entirely separate keyspaces, so no second install is needed. The rate-limit class raises its own low limit through `@TestPropertySource`, which forces Spring to build a separate application context for that class alone.
+**Test isolation is per-store (v1.1, updated v1.4):** the `test` profile points at a separate `transakt_test` database. It no longer uses `create-drop` — the schema is now built by the same Flyway migrations that build production, under `ddl-auto: validate`, which is a stronger check: it verifies that the migrations and the entity mappings genuinely agree. `@Transactional` on each test class rolls back after every test, so tests cannot see each other's data. That rollback now covers idempotency keys and outbox events too, since they are rows in Postgres — only `RateLimitIntegrationTest` still flushes Redis in `@BeforeEach`, because counters survive a database rollback. Tests use Redis database 1 while the application uses 0 — sixteen numbered databases share one server with entirely separate keyspaces, so no second install is needed. The rate-limit class raises its own low limit through `@TestPropertySource`, which forces Spring to build a separate application context for that class alone.
 
-**Two state stores, with a narrower division (v1.4):** PostgreSQL holds everything durable — merchants, payments, ledger entries, and now idempotency keys. Redis holds one thing: rate-limit counters, which expire themselves after sixty seconds and whose loss is harmless.
+Day 20 added a corollary: **a field on a singleton bean is a store too.** `FakeBankClient` remembers its decisions in a `ConcurrentHashMap`, and that map survives between tests in the same context, so `reset()` in `@BeforeEach` is required for the same reason `flushDb()` is. `@Transactional` rolls back Postgres. It does not roll back Redis, and it does not roll back a map living in a Spring bean.
 
-That division moved in v1.4. Idempotency keys previously lived in Redis on the reasoning that they mattered intensely for 24 hours and then never again, with the durability trade accepted knowingly — the v1.0 note said outright that systems which cannot tolerate a lost key store it in the database under a unique index and pay the latency. This is now one of those systems, because the tolerance was smaller than it looked: a lost key does not merely weaken a guarantee, it double-charges a customer.
+**Three stores, each holding what it is good at (v1.6):** PostgreSQL holds everything durable — merchants, payments, ledger entries, idempotency keys and outbox events. Redis holds one thing: rate-limit counters, which expire themselves after sixty seconds and whose loss is harmless. Kafka holds events in flight between the publisher and the consumers, with the outbox table as the durable record behind it.
+
+That last division is the point of the outbox. Kafka is not the source of truth for whether a payment settled — Postgres is. Kafka is the transport, and the outbox row is what makes losing a message survivable.
+
+That division moved once before, in v1.4. Idempotency keys previously lived in Redis on the reasoning that they mattered intensely for 24 hours and then never again, with the durability trade accepted knowingly — the v1.0 note said outright that systems which cannot tolerate a lost key store it in the database under a unique index and pay the latency. This is now one of those systems, because the tolerance was smaller than it looked: a lost key does not merely weaken a guarantee, it double-charges a customer.
 
 **Idempotency is a unique constraint, not a lock (v1.4):** `POST /api/v1/payments` accepts an optional `Idempotency-Key` header. The controller looks the key up in `idempotency_keys` first, and a hit returns the original payment. A miss creates the payment row and the key row together **in a single transaction** — `createPending`, since v1.5 — guarded by `UNIQUE (merchant_id, idempotency_key)`. The ledger entries follow in the second transaction, and only on approval. A retry carrying the same key gets the original payment back — same id, same `createdAt` — rather than creating a second one.
 
@@ -195,9 +249,17 @@ Idempotency takes the opposite answer for the opposite reason, and the asymmetry
 
 **Known limitations:**
 
-- **A payment can be stranded at `PENDING`.** Creation and settlement are separate transactions with a bank call in between, so a process that dies in the gap leaves a payment with no recorded outcome and nothing to resolve it. Worse, the idempotency key is written in the first transaction, so a retry carrying the same key returns the stranded payment rather than starting a fresh attempt — the mechanism that prevents double charges also prevents recovery. A scheduled reconciliation job is the fix and does not exist.
+- **Tests require a live Kafka broker.** Every `@SpringBootTest` starts the `@KafkaListener` against `localhost:9092`. CI has no broker. `spring.kafka.listener.auto-startup: false` in the test profile closes it, and until then the pipeline is unreliable.
+- **The event pipeline is local-only.** Kafka runs in docker-compose; Render has no broker and the development network blocks Aiven at DNS. The deployed instance accumulates unpublished outbox rows.
+- **`@Scheduled` runs on every instance.** `PaymentReconciler` and `OutboxPublisher` both sweep on every running copy of the app. One instance on Render today, so it works; two would sweep the same rows simultaneously. `SELECT ... FOR UPDATE SKIP LOCKED` or ShedLock is the fix.
+- **Webhook delivery is at-least-once with no event id.** A duplicate send is possible and merchants have nothing to deduplicate on. Stripe includes an event id for exactly this; Transakt does not.
+- **`WebhookConsumer` and the dead-letter path are untested.** Verified by hand, not by CI.
+- **A stranded payment is still not fully recoverable by retry.** The reconciler resolves it, but the idempotency key written in transaction one means a retry with the same key returns the stranded payment rather than starting a fresh attempt.
+- **Outbox rows are never deleted.** Published events accumulate forever, same shape of leak as the idempotency keys.
 - **Idempotency keys never expire.** Redis expired them after 24 hours for free; Postgres has no TTL. Rows accumulate indefinitely, growing the table and its unique index without bound. A scheduled delete of rows older than 24 hours is the fix — until then this is a slow leak, traded knowingly for durability.
 - **The idempotency race path is untested.** `IdempotencyIntegrationTest` is `@Transactional`, so a constraint violation would poison the test's own transaction and the recovery block never runs. It does not fire in practice either, because the lookup catches duplicates before any insert is attempted. Exercising it needs two genuinely concurrent requests against a committed database.
+- **Dependency CVEs are unaudited.** Spring Boot 3.4.1 pulls transitive versions with known advisories. Fixing means a parent bump with its own testing.
+- **Redis repository scanning logs five WARNs on every boot**, because `spring-boot-starter-data-redis` tries to claim the JPA repositories. Harmless, noisy, fixable with one annotation.
 - **The free web service spins down after fifteen minutes idle.** A measured cold start exceeded two minutes. Any shared link needs that caveat.
 - **The free managed Postgres expires 17 September 2026**, thirty days after creation, with a fourteen-day grace period. The schema rebuilds from migrations, so the loss would be demo data rather than capability — but it is a date, not a warning that arrives.
 - **The managed Postgres accepts inbound connections from `0.0.0.0/0` by default.** The Key Value store, on the same platform, blocks all external traffic by default. Tightening Postgres to the internal network is the fix.
@@ -206,10 +268,11 @@ Idempotency takes the opposite answer for the opposite reason, and the asymmetry
 - **Idempotency keys are not fingerprinted against the request body.** Reusing a key with a different amount returns the original payment silently; Stripe returns 422 instead. This limitation is itself covered by a test, so changing it cannot happen unnoticed.
 - **The API key prefix carries only about twenty bits of entropy.** `tk_` occupies three of the eight prefix characters, leaving five hex digits. The birthday bound puts a meaningful collision chance somewhere near a thousand merchants, at which point the unique index would begin rejecting legitimate signups. The fix is a longer dedicated random segment in the key format rather than slicing the prefix off the front.
 - **Offset pagination degrades with depth.** `OFFSET 100000` scans and discards every skipped row. Cursor pagination keyed on `(created_at, id)` is the standard answer.
-- **Only one foreign key constraint exists.** `idempotency_keys.payment_id` references `payments(id)`, added in V5. `Payment` still holds `merchantId` and `LedgerEntry` holds `paymentId` as plain scalar columns rather than JPA associations, so Hibernate generated none for those. The database will accept a payment referencing a merchant that does not exist; only the service layer prevents it.
+- **Only one foreign key constraint exists.** `idempotency_keys.payment_id` references `payments(id)`, added in V5. `Payment` still holds `merchantId` and `LedgerEntry` holds `paymentId` as plain scalar columns rather than JPA associations, so Hibernate generated none for those. `outbox_events.aggregate_id` has none by design. The database will accept a payment referencing a merchant that does not exist; only the service layer prevents it.
 - **Signup does not require a password.** The hashing step is guarded on the field being non-null, so a merchant can be created that can never log in. `@NotBlank` on the request would close it.
 - **No merchant-scoped ledger listing.** Ledger entries are reachable only through their parent payment.
 - **There is no ADMIN account on the deployed instance.** Role is server-controlled at signup, so every merchant created through the public API is a MERCHANT and `/api/v1/merchants/**` is unreachable in production. Correct behaviour, but it means the admin paths are only exercised locally and by the test suite.
+- **There is no endpoint to set `webhook_url`.** It is set directly in the database. A `PATCH /api/v1/merchants/me` would close it.
 - `POST /api/v1/merchants` returns 200; REST convention is 201 with a `Location` header. There is no password-change endpoint and no `Retry-After` on 429s.
 
 ## Version log
@@ -229,9 +292,12 @@ Idempotency takes the opposite answer for the opposite reason, and the asymmetry
 | v1.2 | 12 | Flyway migrations replace ddl-auto; paginated payment listing; API keys stored as a lookup prefix plus SHA-256 hash. |
 | v1.3 | 13–14 | Multi-stage Docker image and docker-compose; every external address parameterised; deployed to Render with managed PostgreSQL and Valkey, live over HTTPS. |
 | v1.4 | 15–17 | CI on every push; `/error` permitted so failures report their real status; rate limiter fails open by design; idempotency keys moved into Postgres under a unique constraint, written inside the payment transaction. |
-| **v1.5** | **18** | **A `BankClient` port with a fake adapter; payment creation split into two transactions with the bank call in the gap; ledger entries written only on approval; `PENDING` becomes a real state.** |
-````
+| v1.5 | 18 | A `BankClient` port with a fake adapter; payment creation split into two transactions with the bank call in the gap; ledger entries written only on approval; `PENDING` becomes a real state. |
+| **v1.6** | **19–22** | **Reconciler for stranded payments; transactional outbox; scheduled Kafka publisher stamping only on confirmation; webhook consumer with retry and a dead-letter topic; Kafka in docker-compose under KRaft.** |
+`````
 
-Same four things to verify against the code before committing: the `CAPTURED` / `DECLINED` enum names, whether Day 18 added a V6 migration (if so, both diagrams need `V1-V6`), the class name holding the two new tests, and whether `settle` re-reads the payment or takes the object through.
+Then:
 
-Then `git diff --stat` — expect well over a hundred lines changed on this file. If it says one or two, the paste didn't land.
+```
+git add -A && git commit -m "docs: architecture v1.6 — reconciler, outbox, publisher, webhook consumer" && git diff --stat HEAD~1 && git push
+```
