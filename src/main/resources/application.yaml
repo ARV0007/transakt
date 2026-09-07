@@ -2,7 +2,7 @@ spring:
   application:
     name: transakt
   datasource:
-    url: jdbc:postgresql://${DB_HOST:localhost}:5432/${DB_NAME:transakt}
+    url: jdbc:postgresql://${DB_HOST:localhost}:5432/${DB_NAME:transakt}?sslmode=${DB_SSLMODE:prefer}
     username: ${DB_USER:aman}
     password: ${DB_PASSWORD:}
   jpa:
