@@ -1,31 +1,34 @@
 # Transakt Architecture
 
-## Current: v1.6 — the event pipeline (Days 13–22)
+## Current: v1.7 — the database moves off-platform (Days 13–23)
 
 **Live at https://transakt.onrender.com**
 
 ### Deployment topology
 
-`````mermaid
+```mermaid
 flowchart TD
   client[Merchant server or dashboard]
   client -->|HTTPS| edge[Render edge - Cloudflare - TLS terminates here]
   edge -->|HTTP on the platform-injected PORT| app[Web service 'transakt' - Docker image - Free instance - Singapore]
-  app -->|private network - no TLS needed| pg[(transakt-db - PostgreSQL 18 - Singapore)]
+  app -->|public internet - TLS required, sslmode=require| pg[(Neon - PostgreSQL 18.6 - Singapore - scales to zero)]
   app -->|private network - no TLS needed| kv[(transakt-redis - Valkey 8 - Singapore)]
   gh[GitHub ARV0007/transakt - branch main] -->|Auto-Deploy on push| build[Render build - multi-stage Dockerfile]
-  gh -->|push or pull request| ci[GitHub Actions - twenty-nine tests - no Kafka broker, see limitations]
+  gh -->|push or pull request| ci[GitHub Actions - twenty-nine tests against service containers]
   build --> app
   flyway[Flyway V1-V8 - runs at container startup, before Hibernate validates] -.-> pg
   note[Kafka is NOT deployed - it runs only in docker-compose locally] -.-> app
-`````
+```
 
-All three services sit in the same region because Render's private networking is per-region — an
-internal hostname resolves only from inside it. The public internet reaches exactly one of them.
+The app and the Key Value store sit in the same Render region and talk over private networking,
+which is per-region — an internal hostname resolves only from inside it. Since v1.7 the database
+is no longer one of them: Neon is a separate provider reached over the public internet, so that
+connection is encrypted rather than merely internal. Two of the three are still invisible to the
+outside world.
 
 ### Application internals
 
-`````mermaid
+```mermaid
 flowchart TD
   server[Merchant server - a machine]
   human[Merchant dashboard - a human]
@@ -63,7 +66,7 @@ flowchart TD
   settle --> db
   oer --> db
   flyway[Flyway V1-V8 - runs once at startup, before Hibernate validates] -.-> db
-`````
+```
 
 **How a request flows:** Tomcat parses the HTTP request. Three filters run before any controller. `JwtAuthFilter` looks for an `Authorization: Bearer` header and, if the signature verifies and the token has not expired, records the caller's merchant ID and role in the SecurityContext with no database access. `ApiKeyFilter` then looks for `X-API-Key` and, if the context is still empty, takes the key's first eight characters as a lookup prefix, finds the single matching merchant row through a unique index, and compares the SHA-256 of the whole key against the stored hash before recording the same identity. `RateLimitFilter` runs last of the three — deliberately, because it needs an identity to count against — and refuses the request outright with 429 if that merchant has exceeded its per-minute allowance. The DispatcherServlet then routes to a controller. Controllers read the caller's identity from the SecurityContext and hand services plain values, so services stay free of Spring Security types. Creating a payment is no longer one transaction: `PaymentProcessor` opens one to record the attempt, closes it, calls the bank, then opens a second to record the outcome. Each half is still atomic — the payment row and its idempotency key together, then the final status, both ledger entries and the outbox event together — but the two halves are not atomic with each other, and that is deliberate.
 
@@ -79,7 +82,7 @@ That processor is a separate bean rather than a third method on `PaymentService`
 
 **Payment status is a state machine now (v1.5):**
 
-`````mermaid
+```mermaid
 stateDiagram-v2
   [*] --> PENDING: createPending - transaction 1
   PENDING --> CAPTURED: settle - bank approved - two ledger entries written
@@ -89,7 +92,7 @@ stateDiagram-v2
     transactions strands a payment here.
     PaymentReconciler sweeps these (v1.6).
   end note
-`````
+```
 
 **What the split costs.** Atomicity was doing real work and now it is not. One transaction meant a payment either fully existed or fully did not. Two means there is an observable state in between: a row at `PENDING` with no outcome recorded. That gap cannot be closed by rearranging code. It is the price of not blocking, and every real payment system pays it. The standard answer is a reconciliation job that sweeps `PENDING` rows past some age, asks the bank what actually happened, and settles them. Since v1.6 this one has it.
 
@@ -141,7 +144,7 @@ Two properties pull against each other and the dead letter satisfies both. Retri
 
 The configuration detail that matters is **two listeners**. Containers on the compose network reach the broker at `kafka:29092`; the Mac reaches it at `localhost:9092`. A broker hands clients its *advertised* address, so one address cannot serve both — get it wrong and the client connects, is told to go somewhere it cannot reach, and hangs. The consequence for deployment is that the live Render instance has no broker: `OutboxPublisher` runs there and finds nothing to send, because nothing settles without a Kafka to publish to. **The event pipeline is currently a local-only capability.**
 
-**One artifact, three environments (v1.3):** every external address in `application.yaml` is now `${VAR:sensible-default}` — database host, name, user and password; Redis host, port and password; the Kafka bootstrap servers; the HTTP port; the JWT secret; the rate limit. The same jar and the same image run on a MacBook, inside docker-compose, and in Singapore. Only the environment differs.
+**One artifact, three environments (v1.3):** every external address in `application.yaml` is now `${VAR:sensible-default}` — database host, name, user, password and SSL mode; Redis host, port and password; the Kafka bootstrap servers; the HTTP port; the JWT secret; the rate limit. The same jar and the same image run on a MacBook, inside docker-compose, and in Singapore. Only the environment differs.
 
 The defaults are not laziness, they are the thing that keeps local development at zero setup: with no variables set at all, the app looks for Postgres, Redis and Kafka on localhost, which is exactly where they are on the development machine. Compose overrides the hosts with service names. Render overrides them with managed hostnames. Nothing branches on an environment name, and there is no `application-prod.yaml` — a profile would be a fourth thing to keep in sync, and every value it would hold is already a variable.
 
@@ -153,29 +156,55 @@ Instruction order inside the build stage is a design decision rather than a form
 
 `docker-compose.yml` runs four services since v1.6 — `postgres:18`, `redis:8-alpine`, `apache/kafka:4.0.0` and the app. Two details matter. Service names are hostnames inside the compose network, so the app reaches the database at `postgres`; `localhost` inside a container means *that container*, not the host. And `depends_on` alone is not enough, because it waits for the container to exist rather than for Postgres to accept connections — the app boots in three seconds and would lose that race routinely. Healthchecks with `condition: service_healthy` are load-bearing. Only Postgres gets a named volume; Redis and Kafka deliberately don't, because their contents are development scratch. Only the app and Kafka publish ports, which keeps the data stores invisible to the host and avoids colliding with Postgres.app on 5432.
 
+Compose still runs its own Postgres after v1.7. Local development does not point at Neon and should not: a container that starts in two seconds and can be thrown away is better for development than a shared remote database, and the whole point of parameterised config is that the same image works against either.
+
 The first containerised run was also the clearest proof of Day 12a's value: V1 through V4 applied as real SQL against a completely empty Postgres that had never seen this project, with no baselining, on infrastructure nobody had configured.
 
-**Deployed (v1.3):** Render, free tier, three resources — a Docker web service, managed PostgreSQL 18, and a managed Key Value store. That last one runs **Valkey 8**, the fork created after Redis changed its licence; it is wire-compatible, so Lettuce and Spring Data Redis needed no changes at all.
+**Deployed (v1.3, revised v1.7):** Render, free tier. Originally three resources — a Docker web service, managed PostgreSQL 18, and a managed Key Value store. Since v1.7 the database sits elsewhere and Render holds two. The Key Value store runs **Valkey 8**, the fork created after Redis changed its licence; it is wire-compatible, so Lettuce and Spring Data Redis needed no changes at all.
 
-Auto-Deploy watches `main` on GitHub and rebuilds on push, which means the deployed artifact is whatever is *pushed* rather than whatever is saved locally — a distinction that cost a day. Flyway is what makes redeployment cheap: the schema builds itself from eight migration files on any database, so a fresh instance needs no manual SQL and losing the free Postgres to expiry costs demo data rather than the ability to run.
+Auto-Deploy watches `main` on GitHub and rebuilds on push, which means the deployed artifact is whatever is *pushed* rather than whatever is saved locally — a distinction that cost a day. Flyway is what makes redeployment cheap: the schema builds itself from eight migration files on any database, so a fresh instance needs no manual SQL and losing a database costs demo data rather than the ability to run. **That claim stopped being theoretical on Day 23**, when the entire schema was rebuilt on a different provider by changing five environment variables.
 
-Two properties of the free tier are worth stating rather than discovering. The web service spins down after fifteen minutes idle, and the first request afterwards has been measured at **over two minutes**, not the fifty seconds advertised — so a link shared for review needs that caveat attached. And the managed Postgres expires thirty days after creation, with a fourteen-day grace period.
+Two properties of the free tier are worth stating rather than discovering. The web service spins down after fifteen minutes idle, and the first request afterwards has been measured at **over two minutes**, not the fifty seconds advertised — so a link shared for review needs that caveat attached. And the managed Postgres expired thirty days after creation, with a fourteen-day grace period, which is what forced v1.7.
 
-One asymmetry is worth auditing rather than inheriting: the managed Postgres ships with an inbound rule of `0.0.0.0/0`, accepting connections from the entire internet with only a password in front of it, while the Key Value store ships blocking all external traffic. Same platform, two opposite defaults, neither of them a decision anyone made.
+One asymmetry was worth auditing rather than inheriting: the managed Postgres shipped with an inbound rule of `0.0.0.0/0`, accepting connections from the entire internet with only a password in front of it, while the Key Value store shipped blocking all external traffic. Same platform, two opposite defaults, neither of them a decision anyone made.
 
-**A startup hook is not free (v1.3):** a `@Bean CommandLineRunner` runs *after* the context refreshes and Tomcat binds — and if it throws, `SpringApplication.run` treats the whole startup as failed, closes the context and exits non-zero. That ordering is the trap: the image builds, the database connects, the migrations apply and the server starts, every time, and then a single line at the very end takes the process down. Debug scaffolding that touches an external service is therefore not neutral; it converts an optional dependency into a hard startup requirement. Redis is optional for booting this application by design, and one such runner made it mandatory for three days.
+**The database moves off-platform (v1.7).** Render's free Postgres expires thirty days after creation. Recreating it monthly is a recurring chore with a deletion at the end of it if forgotten, so the database moved to **Neon**, whose free tier does not expire.
 
-**Continuous integration (Day 15):** `.github/workflows/ci.yml` runs the full suite on every push and every pull request to `main`. The runner starts `postgres:18` and `redis:8-alpine` as health-checked service containers, sets up Temurin 21 with a cached Maven repository, and runs `./mvnw test` — roughly seventy seconds, green on the first run. The one real catch was invisible until both config files were read against each other: `application-test.yaml` sets only the JDBC URL, so username and password fall through to `application.yaml`'s defaults, and Postgres.app trusts local connections without a password while the container demands one. A step-level `DB_PASSWORD` closes it.
+The migration was almost entirely configuration, and that is the point. Five environment variables changed on Render, one line changed in `application.yaml`, and Flyway rebuilt all eight tables on first boot against a database that had never seen the project. **No data was moved**, because there was nothing worth moving — the deployed rows were demo merchants recreatable with two curl commands, and the schema is not data, it is eight files in version control.
+
+The one code change was SSL. The URL template read `jdbc:postgresql://${DB_HOST}:5432/${DB_NAME}` with no encryption parameter, which was fine when the database sat on Render's private network and is not fine across the public internet — Neon refuses unencrypted connections outright. It became:
+
+```
+jdbc:postgresql://${DB_HOST:localhost}:5432/${DB_NAME:transakt}?sslmode=${DB_SSLMODE:prefer}
+```
+
+`prefer` is what keeps one artifact working in three places. The driver attempts SSL and falls back if the server does not offer it, so the Mac and compose are untouched. Render sets `DB_SSLMODE=require`, which removes the fallback and refuses to connect in the clear. Same pattern as every other value in the file: a default that makes local development work with no setup, an override where production needs something stricter.
+
+Two trade-offs came with it, and both are real. Every query now crosses the public internet rather than staying inside a Singapore datacentre — correctness is unaffected and TLS makes it safe, but latency is worse than a private hop. And Neon's free tier **scales compute to zero after five minutes idle**, so the first query after a quiet period pays a wake-up cost on top of Render's own cold start. For a demo that sleeps most of the day, both are acceptable; for anything with real traffic, neither would be.
+
+**Continuous integration (Day 15):** `.github/workflows/ci.yml` runs the full suite on every push and every pull request to `main`. The runner starts `postgres:18` and `redis:8-alpine` as health-checked service containers, sets up Temurin 21 with a cached Maven repository, and runs `./mvnw test` — under a minute, green on the first run. The one real catch was invisible until both config files were read against each other: `application-test.yaml` sets only the JDBC URL, so username and password fall through to `application.yaml`'s defaults, and Postgres.app trusts local connections without a password while the container demands one. A step-level `DB_PASSWORD` closes it.
 
 What CI proves goes beyond the assertions. The runner's database is empty and the test profile sets `baseline-on-migrate: false`, so V1 through V8 execute as real SQL on every push and Hibernate then validates the result against the entity mappings. **Every push is a proof that the migrations build a working schema on a machine that has never seen this project.**
 
-**CI is currently broken by v1.6 and this is known.** Every `@SpringBootTest` now starts the `@KafkaListener`, which connects to `localhost:9092`. The runner has Postgres and Redis service containers but no Kafka, so the suite will hang or fail there. The fix is `spring.kafka.listener.auto-startup: false` in the test profile — the listener is not what those tests are testing, and starting it makes twenty-nine tests depend on infrastructure that only one of them cares about.
+**The Kafka listener is disarmed in tests (Day 23).** v1.6 left a trap: every `@SpringBootTest` starts the `@KafkaListener`, which connects to `localhost:9092`, and the CI runner has no broker. The pipeline had not gone red yet — a listener that cannot reach a broker retries in the background without failing the context — but it was one timeout away from doing so. `spring.kafka.listener.auto-startup: false` in the test profile creates the listener container and leaves it stopped. Nothing loses coverage: the only test that exercises publishing is a unit test with a mocked `KafkaTemplate`, and no test covers the consumer at all.
+
+**The same read found a fourth misplaced key, and this one had been distorting every run.** `application-test.yaml` had its `bank:` block indented two spaces, nesting it under `ratelimit:`. Spring read it as `ratelimit.bank.decline-rate` and nothing consumed that, so `FakeBankClient` fell back to its defaults: a random decline rate and two hundred to eight hundred milliseconds of simulated latency, on every test that created a payment.
+
+The consequences were quiet and separate. The suite spent about twenty seconds per run sleeping for a bank that was configured to be instantaneous — un-indenting one block took it from roughly forty-five seconds to twenty-five. And bank decisions were **non-deterministic in tests that had nothing to do with bank decisions**: `IdempotencyIntegrationTest` logs showed APPROVED and DECLINED interleaved across a run whose assertions concern neither.
+
+What hid it is worth naming. The two tests that genuinely care about the decision — `ApprovedPaymentIntegrationTest` and `DeclinedPaymentIntegrationTest` — set the rate themselves rather than trusting the profile. So the tests that were explicit stayed correct, and the tests that were indifferent absorbed the randomness without ever failing. **A test that does not assert on a value will not tell you the value is wrong.**
+
+Fourth occurrence of the same failure mode in this project, after `server.port` inside `flyway:`, `spring.kafka` inside `jpa.properties.hibernate`, and this. The pattern is now well enough established to state as a rule: **when adding a key to a YAML file, verify the value is actually read, not merely that the application starts.**
 
 **A 403 can hide a 500 (Day 16):** with Redis unreachable, every authenticated request returned an empty-bodied 403 — which reads as a permissions problem and is not one. Nothing was catching the `RedisConnectionFailureException`. Tomcat set 500 and dispatched internally to `/error`, and because Spring Boot registers the security filter chain for the `ERROR` dispatch as well — while `OncePerRequestFilter.shouldNotFilterErrorDispatch()` returns true by default, so the custom filters skip it — that dispatch arrived unauthenticated and `anyRequest().authenticated()` denied it. **The error page, whose entire job is reporting failures, was failing its own permissions check, and its 403 overwrote the real status.** `.requestMatchers("/error").permitAll()` as the first matcher fixes it. Any application with a catch-all `authenticated()` rule needs that line, or every unhandled exception surfaces as an authorization failure.
+
+**A startup hook is not free (v1.3):** a `@Bean CommandLineRunner` runs *after* the context refreshes and Tomcat binds — and if it throws, `SpringApplication.run` treats the whole startup as failed, closes the context and exits non-zero. That ordering is the trap: the image builds, the database connects, the migrations apply and the server starts, every time, and then a single line at the very end takes the process down. Debug scaffolding that touches an external service is therefore not neutral; it converts an optional dependency into a hard startup requirement. Redis is optional for booting this application by design, and one such runner made it mandatory for three days.
 
 **Schema is versioned, not inferred (v1.2):** the database shape is now defined by numbered SQL migrations in `db/migration` rather than derived from the entity classes at startup. Hibernate runs in `validate` mode — it compares entities against the schema and refuses to start on a mismatch, but never builds anything. All construction is Flyway's. This closes a real gap: `ddl-auto: update` cannot add a `NOT NULL` column to a populated table, so the fix on Day 8 was a hand-run `ALTER TABLE` that existed only on one laptop and was recorded nowhere. Every schema change is now a reviewable file with a checksum, replayable on any machine. Flyway runs inside application startup, which means a failed boot performs no migration at all and leaves the database exactly as it was.
 
 The existing development database was **baselined** rather than rebuilt: `baseline-on-migrate` writes a marker row and skips everything at or below version 1, because those tables already existed. The test database, created empty, runs V1 for real — making `./mvnw test` the only place the initial migration actually executes, and therefore the proof that it is correct. The test profile deliberately sets `baseline-on-migrate: false`, so a test database left in an unexpected state fails the build loudly rather than silently baselining and skipping a migration. A side effect worth knowing: the dev database reports one more migration than the test database, because the baseline marker counts.
+
+The Neon database created in v1.7 is the third to be built this way, after the compose container and the CI runner, and the only one where it mattered in production.
 
 **Collections are paginated (v1.2):** `GET /api/v1/payments` returns a page rather than every matching row — twenty by default, newest first, with a server-enforced ceiling of one hundred. Without that cap the parameter is a suggestion rather than a protection, since a client could simply ask for a million. Spring Data rewrites the query to add `LIMIT`/`OFFSET`, and the resulting `WHERE merchant_id = ? ORDER BY created_at DESC` is exactly what the index added in the same day's first migration was built for. The response is serialised through `PagedModel` rather than as a raw `PageImpl`, because `PageImpl`'s field layout is a framework implementation detail and publishing it would make a library refactor a breaking API change. The known ceiling is offset depth: `OFFSET 100000` makes Postgres walk and discard a hundred thousand rows, which is why cursor-based pagination exists.
 
@@ -185,13 +214,13 @@ SHA-256 rather than BCrypt is deliberate. Slow hashing defends against guessable
 
 The migration was performed as **expand and contract** across four steps: add the columns nullable and backfill them, start writing them on every signup, switch the reader, then enforce `NOT NULL` and drop the old column. Between the first and last step the database supported both shapes, so no intermediate state could lose data, and the only irreversible step was last and isolated. Two orderings inside that sequence are easy to get backwards and both matter: writers must switch before readers, or a merchant created in between has a key but no hash; and `NOT NULL` belongs to the contract phase, because during expand the entity does not yet map the columns and every insert would write null.
 
-**The test suite (v1.1, twenty-nine tests since v1.6):** twenty-seven integration tests plus two unit tests, running against the full stack in about forty seconds. `AuthIntegrationTest` covers signup, login and both failure paths. `OwnershipIntegrationTest` covers foreign payments and ledgers returning 404, list scoping, and the forged `merchantId` being ignored. `IdempotencyIntegrationTest` covers key reuse, key scoping per merchant, and the deliberate decision not to fingerprint the request body. `RateLimitIntegrationTest` covers the 429 threshold and the fact that one merchant hitting the ceiling does not affect another. All use `MockMvc`, which sends real requests through the entire filter chain and into a real database without opening a network port.
+**The test suite (v1.1, twenty-nine tests since v1.6):** twenty-seven integration tests plus two unit tests, running against the full stack in about twenty-five seconds since the Day 23 config fix. `AuthIntegrationTest` covers signup, login and both failure paths. `OwnershipIntegrationTest` covers foreign payments and ledgers returning 404, list scoping, and the forged `merchantId` being ignored. `IdempotencyIntegrationTest` covers key reuse, key scoping per merchant, and the deliberate decision not to fingerprint the request body. `RateLimitIntegrationTest` covers the 429 threshold and the fact that one merchant hitting the ceiling does not affect another. All use `MockMvc`, which sends real requests through the entire filter chain and into a real database without opening a network port.
 
 All five idempotency tests passed **unchanged** through the v1.4 rewrite, while the entire storage layer beneath them was replaced. That is the payoff for testing through the front door rather than mocking the service: the tests describe the contract, so they survive any implementation that still honours it.
 
 `RateLimitServiceTest` is the exception that proves the rule — the project's first unit test, and correct precisely because the behaviour it covers is a single catch block. Exercising it requires Redis to fail *on demand*, which a mocked `StringRedisTemplate` does cleanly and a real one does not. Test at the level where the behaviour actually lives.
 
-Day 18 added two tests pinning the payment state machine: `ApprovedPaymentIntegrationTest` asserts a payment ends `CAPTURED` with two balancing ledger entries, `DeclinedPaymentIntegrationTest` that it ends `FAILED` with none. Both set `FakeBankClient`'s decline rate explicitly — zero or one hundred — rather than letting it randomise. **A random decline rate is a feature by hand and a defect in CI.** Exploring manually, it shows you both branches without touching config. In a pipeline it makes a red build mean nothing, and a test that flips a coin trains you to re-run CI instead of reading it.
+Day 18 added two tests pinning the payment state machine: `ApprovedPaymentIntegrationTest` asserts a payment ends `CAPTURED` with two balancing ledger entries, `DeclinedPaymentIntegrationTest` that it ends `FAILED` with none. Both set `FakeBankClient`'s decline rate explicitly — zero or one hundred — rather than letting it randomise. **A random decline rate is a feature by hand and a defect in CI.** Exploring manually, it shows you both branches without touching config. In a pipeline it makes a red build mean nothing, and a test that flips a coin trains you to re-run CI instead of reading it. That explicitness is also what kept them correct through three days of a broken test profile.
 
 Days 19–21 added three more classes. `ReconcilerIntegrationTest` pins both sweeper outcomes, and the second is the one that earns its place: when the bank has no record, the payment must be left **completely alone** — status unchanged, ledger empty, count zero. Three positive assertions about absence, because "no exception was thrown" would pass against a reconciler that deleted the row. It guards the change someone will genuinely want to make: closing stuck rows as `FAILED` looks like housekeeping in a diff and is the most expensive bug a gateway can ship.
 
@@ -249,7 +278,6 @@ Idempotency takes the opposite answer for the opposite reason, and the asymmetry
 
 **Known limitations:**
 
-- **Tests require a live Kafka broker.** Every `@SpringBootTest` starts the `@KafkaListener` against `localhost:9092`. CI has no broker. `spring.kafka.listener.auto-startup: false` in the test profile closes it, and until then the pipeline is unreliable.
 - **The event pipeline is local-only.** Kafka runs in docker-compose; Render has no broker and the development network blocks Aiven at DNS. The deployed instance accumulates unpublished outbox rows.
 - **`@Scheduled` runs on every instance.** `PaymentReconciler` and `OutboxPublisher` both sweep on every running copy of the app. One instance on Render today, so it works; two would sweep the same rows simultaneously. `SELECT ... FOR UPDATE SKIP LOCKED` or ShedLock is the fix.
 - **Webhook delivery is at-least-once with no event id.** A duplicate send is possible and merchants have nothing to deduplicate on. Stripe includes an event id for exactly this; Transakt does not.
@@ -258,11 +286,12 @@ Idempotency takes the opposite answer for the opposite reason, and the asymmetry
 - **Outbox rows are never deleted.** Published events accumulate forever, same shape of leak as the idempotency keys.
 - **Idempotency keys never expire.** Redis expired them after 24 hours for free; Postgres has no TTL. Rows accumulate indefinitely, growing the table and its unique index without bound. A scheduled delete of rows older than 24 hours is the fix — until then this is a slow leak, traded knowingly for durability.
 - **The idempotency race path is untested.** `IdempotencyIntegrationTest` is `@Transactional`, so a constraint violation would poison the test's own transaction and the recovery block never runs. It does not fire in practice either, because the lookup catches duplicates before any insert is attempted. Exercising it needs two genuinely concurrent requests against a committed database.
+- **The database is no longer on the same private network as the app (v1.7).** Every query crosses the public internet under TLS rather than staying inside Render's Singapore network. Correctness is unaffected and `sslmode=require` makes it safe, but latency is worse than a private hop and there is one more provider in the failure path.
+- **Neon scales compute to zero after five minutes idle.** The first query after a quiet period pays a wake-up cost on top of Render's own cold start. Fine for a demo, wrong for anything with real traffic.
+- **The Neon free tier caps at 0.5 GB of storage and 100 compute-hours per month.** Neither is close today, and neither produces a warning before it bites.
 - **Dependency CVEs are unaudited.** Spring Boot 3.4.1 pulls transitive versions with known advisories. Fixing means a parent bump with its own testing.
 - **Redis repository scanning logs five WARNs on every boot**, because `spring-boot-starter-data-redis` tries to claim the JPA repositories. Harmless, noisy, fixable with one annotation.
 - **The free web service spins down after fifteen minutes idle.** A measured cold start exceeded two minutes. Any shared link needs that caveat.
-- **The free managed Postgres expires 17 September 2026**, thirty days after creation, with a fourteen-day grace period. The schema rebuilds from migrations, so the loss would be demo data rather than capability — but it is a date, not a warning that arrives.
-- **The managed Postgres accepts inbound connections from `0.0.0.0/0` by default.** The Key Value store, on the same platform, blocks all external traffic by default. Tightening Postgres to the internal network is the fix.
 - **Unauthenticated traffic is not rate limited.** The filter guards on an existing identity, so brute-forcing `/auth/login` hits no ceiling. Production gateways add an IP-keyed limiter.
 - **Fixed-window rate limiting allows a boundary burst** — twenty requests either side of a minute boundary is forty in two seconds. Sliding windows via sorted sets fix it at more complexity.
 - **Idempotency keys are not fingerprinted against the request body.** Reusing a key with a different amount returns the original payment silently; Stripe returns 422 instead. This limitation is itself covered by a test, so changing it cannot happen unnoticed.
@@ -293,11 +322,5 @@ Idempotency takes the opposite answer for the opposite reason, and the asymmetry
 | v1.3 | 13–14 | Multi-stage Docker image and docker-compose; every external address parameterised; deployed to Render with managed PostgreSQL and Valkey, live over HTTPS. |
 | v1.4 | 15–17 | CI on every push; `/error` permitted so failures report their real status; rate limiter fails open by design; idempotency keys moved into Postgres under a unique constraint, written inside the payment transaction. |
 | v1.5 | 18 | A `BankClient` port with a fake adapter; payment creation split into two transactions with the bank call in the gap; ledger entries written only on approval; `PENDING` becomes a real state. |
-| **v1.6** | **19–22** | **Reconciler for stranded payments; transactional outbox; scheduled Kafka publisher stamping only on confirmation; webhook consumer with retry and a dead-letter topic; Kafka in docker-compose under KRaft.** |
-`````
-
-Then:
-
-```
-git add -A && git commit -m "docs: architecture v1.6 — reconciler, outbox, publisher, webhook consumer" && git diff --stat HEAD~1 && git push
-```
+| v1.6 | 19–22 | Reconciler for stranded payments; transactional outbox; scheduled Kafka publisher stamping only on confirmation; webhook consumer with retry and a dead-letter topic; Kafka in docker-compose under KRaft. |
+| **v1.7** | **23** | **Kafka listener disarmed in tests so CI no longer needs a broker; a misplaced `bank:` block in the test profile found and fixed, making bank decisions deterministic and the suite twice as fast; PostgreSQL moved from expiring Render free tier to Neon, with `sslmode` parameterised so one artifact still runs in three places.** |

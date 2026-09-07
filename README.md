@@ -164,7 +164,7 @@ problem; see limitations.
 
 ## Stack
 
-Java 21 · Spring Boot 3.4.1 · Spring Security · Spring Data JPA · PostgreSQL 18 · Redis
+Java 21 · Spring Boot 3.4.1 · Spring Security · Spring Data JPA · PostgreSQL 18 (Neon) · Redis
 (Valkey in production) · Apache Kafka 4.0 (KRaft) · Spring Kafka · Flyway · jjwt · Maven ·
 Docker · GitHub Actions · deployed on Render
 
@@ -252,8 +252,7 @@ Stated rather than discovered:
 - **There is no endpoint to set `webhook_url`.** It is set directly in the database today.
 - **Dependency CVEs are unaudited.** Spring Boot 3.4.1 pulls transitive versions with known
   advisories.
-- **The free Postgres expires 17 September 2026.** The schema rebuilds from migrations, so the
-  loss is demo data rather than capability.
+
 
 ---
 
