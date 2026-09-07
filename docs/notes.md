@@ -1881,3 +1881,89 @@ Also worth naming: adding a consumer to the same application is a stepping stone
 not a destination. In production, webhook delivery would be its own deployable
 service consuming the same topic. The event boundary is what makes that a
 deployment change rather than a rewrite.
+
+## Why the database could move in twenty minutes
+
+On Day 23 this project changed database providers. Total work: five environment variables, one
+line of YAML, one redeploy. No export, no import, no downtime worth the name.
+
+That is not because the move was trivial. It is because three decisions made earlier had already
+paid for it, and none of them looked like they were about database migration at the time.
+
+### The schema was never on the server
+
+Since Day 12, the shape of the database has been defined by numbered SQL files in the repository,
+and Hibernate has run in `validate` mode — it checks the entities against the schema and refuses
+to start on a mismatch, but never builds anything.
+
+The consequence is that **a database is not a thing you have, it is a thing you can produce**.
+Point the app at an empty Postgres anywhere and eight files construct the whole schema, in order,
+with checksums. That property had already been exercised three times — the compose container, the
+CI runner, and every developer machine — but always somewhere disposable.
+
+Day 23 was the first time it mattered in production. Flyway connected to an empty Neon database,
+found no `flyway_schema_history` table, created one, and applied V1 through V8. The new database
+was correct because the old one had never been the source of truth about its own shape.
+
+The counterfactual is worth stating. With `ddl-auto: update` and a schema that had drifted through
+hand-run `ALTER TABLE` statements — which is exactly where this project was on Day 8 — the move
+would have meant dumping, inspecting, and hoping. Instead it meant changing a hostname.
+
+### Every address was already a variable
+
+Since Day 13, no external address has been hardcoded. Database host, name, user, password; Redis
+host and port; Kafka bootstrap servers; the HTTP port; the JWT secret. All of them
+`${VAR:sensible-default}`.
+
+The defaults are the interesting part. They point at localhost, so a fresh clone runs with zero
+setup. Compose overrides them with service names. Render overrides them with managed hostnames.
+Nothing branches on an environment name and there is no `application-prod.yaml`, because a profile
+would be a fourth thing to keep in sync and every value it would hold is already a variable.
+
+So "move the database" was not a code change. It was five values in a form.
+
+### The one thing that did need changing, and why it was a variable too
+
+Neon refuses unencrypted connections. The URL template had no SSL parameter, because Render's
+managed Postgres sat on a private network where encryption was optional.
+
+The tempting fix is to add `?sslmode=require` and move on. That breaks local development — a
+Postgres that doesn't offer TLS rejects a client that demands it. The opposite hardcoding,
+`disable`, breaks Neon. Neither value is correct in both places, which is the signal that it
+should not be a constant:
+
+```
+?sslmode=${DB_SSLMODE:prefer}
+```
+
+`prefer` attempts SSL and falls back if unavailable. Local and compose keep working untouched.
+Render sets `require`, which removes the fallback and refuses to connect in the clear.
+
+**The default is permissive and the override is strict**, which is the right way round: a
+developer who sets nothing gets something that works, and production explicitly asks for the
+stronger guarantee rather than inheriting it by luck. A value that is correct by accident looks
+identical to one that is correct by design, right up until the accident stops holding.
+
+### What it cost
+
+Two things, both real, both worth naming rather than glossing.
+
+The database is no longer on the same private network as the app. Every query crosses the public
+internet under TLS. Correctness is unaffected and the encryption makes it safe, but a private hop
+inside one datacentre is faster than a public one between two, and there is now one more provider
+in the failure path.
+
+And Neon scales compute to zero after five minutes idle. The first query after a quiet period
+pays a wake-up cost — on top of Render's own fifteen-minute spin-down. For a demo that sleeps
+most of the day and wants to cost nothing, that trade is obviously right. For anything with real
+traffic it would be obviously wrong.
+
+### The general lesson
+
+Portability is not a feature you add when you need it. It is a property that either exists
+because of decisions made months earlier, or does not exist at all, and you find out which on the
+day you need to move.
+
+The decisions that bought it here — version the schema, parameterise every address, default
+permissive and override strict — each looked like ordinary hygiene at the time. None of them was
+motivated by "we might change providers." That is usually how this works.

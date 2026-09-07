@@ -1512,3 +1512,86 @@ up until the accident stops holding.
 - `@Scheduled` still runs on every instance.
 - Idempotency keys still have no TTL.
 - Free Render Postgres expires **17 September 2026**.
+
+## Day 23 — the config that was never read, and moving the database (7 Sep 2026)
+
+**Built**
+- `spring.kafka.listener.auto-startup: false` in `application-test.yaml`.
+- Un-indented the `bank:` block in the same file from under `ratelimit:` to top level.
+- `?sslmode=${DB_SSLMODE:prefer}` on the JDBC URL in `application.yaml`.
+- Neon project created; five environment variables changed on Render; schema rebuilt from
+  migrations on first boot. 29 tests still green, CI green in 57 seconds.
+
+**Why**
+
+Two problems, both about configuration rather than code.
+
+The Kafka listener starts on every `@SpringBootTest` and connects to `localhost:9092`, which CI
+does not have. CI had stayed green anyway — a listener that cannot reach a broker retries in the
+background without failing the context — so this was one timeout away from going red rather than
+already red. `auto-startup: false` builds the listener container and leaves it stopped. Nothing
+loses coverage: the only publishing test mocks `KafkaTemplate`, and no test covers the consumer.
+
+The database problem had a date on it. Render's free Postgres expires thirty days after creation,
+so it was either recreate it every month or move. Neon's free tier does not expire, which turns a
+recurring chore into a one-off.
+
+**Concepts**
+- *A misplaced YAML key fails silently; a misspelled one fails loudly.* Fourth occurrence in this
+  project. `bank:` was indented two spaces, so Spring read it as `ratelimit.bank.decline-rate`,
+  nothing consumed it, and `FakeBankClient` fell back to its defaults on every test run: a random
+  decline rate and 200–800ms of simulated latency.
+- *A test that does not assert on a value will not tell you the value is wrong.* This is what hid
+  it for three days. The two tests that care about the decline rate set it themselves rather than
+  trusting the profile, so they stayed correct; every other test absorbed the randomness without
+  ever failing. Correctness by explicitness, not by configuration.
+- *The cost was invisible because it was distributed.* Twenty seconds a run spent sleeping for a
+  bank configured to be instantaneous — forty-five seconds down to twenty-five once fixed — and
+  non-deterministic bank decisions in tests whose assertions concern neither.
+- *`prefer` is what lets one artifact serve three environments.* The driver tries SSL and falls
+  back if the server doesn't offer it. A hardcoded `require` breaks local Postgres; a hardcoded
+  `disable` breaks Neon. The variable is what keeps both true, same as every other address in
+  the file.
+- *Migrations are what made the move cheap.* The schema is eight files in version control, not a
+  thing that lives on a server. Nothing was exported, nothing was imported — Flyway found an
+  empty database, created `flyway_schema_history`, and applied V1 through V8. The claim that
+  "the schema rebuilds itself anywhere" had been in the architecture doc since Day 13; this is
+  the first time it was load-bearing in production.
+- *Every migration buys something and costs something.* Queries now cross the public internet
+  under TLS rather than staying inside Render's Singapore network — safe, slightly slower. And
+  Neon scales compute to zero after five minutes idle, so the first query after a quiet spell
+  pays a wake-up on top of Render's own cold start. Acceptable for a demo; wrong for traffic.
+
+**Interview line**
+
+"The free database tier expired monthly, so I moved it to a provider whose free tier doesn't.
+The migration was five environment variables and one line of YAML, because the schema lives in
+eight Flyway files rather than on a server — the new database built itself on first boot. The
+only code change was making the SSL mode a variable with a permissive default, so the same image
+still runs against a local Postgres that doesn't offer TLS and a managed one that requires it."
+
+**Mistake & fix**
+
+Two, and the second is the more embarrassing one.
+
+The `bank:` indentation, described above. Found by reading the whole test profile aloud rather
+than scanning for the line being changed — which is the only reliable way to catch this class of
+bug, because the wrong version is syntactically perfect.
+
+And a database password ended up echoed on screen and written to `~/.zsh_history` in plaintext.
+The mechanism: `read -s VAR` captures silently, so there is no feedback about whether it worked,
+and when a stray Enter arrived first the shell took the next line as a command —
+`zsh: command not found: npg_...`. The password was rotated, the history file cleared with
+`rm ~/.zsh_history && unset HISTFILE && exec zsh` (the `unset` matters, or the exiting shell
+writes its in-memory copy back).
+
+The real fix is not a better `read` invocation. **Put the secret where it is actually needed** —
+Render's environment page — rather than staging it through a shell. A secret that never enters a
+terminal cannot leak from one.
+
+**Still open**
+- `WebhookConsumer` and the dead-letter path remain untested.
+- No event id in the webhook payload, so an at-least-once delivery can't be deduplicated.
+- Outbox rows and idempotency keys are never deleted. Two slow leaks.
+- `@Scheduled` still runs on every instance.
+- Neon caps at 0.5 GB and 100 compute-hours a month. Neither is close; neither warns.
