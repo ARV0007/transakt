@@ -156,9 +156,9 @@ database at startup, so there is no setup SQL to run and nothing to configure.
 ./mvnw test
 ```
 
-Twenty-nine tests, about forty seconds. Needs Postgres, Redis **and Kafka** reachable on
-localhost — `docker compose up` provides all three. The Kafka dependency in tests is a known
-problem; see limitations.
+Twenty-nine tests, about twenty-five seconds. Needs Postgres and Redis reachable on localhost —
+`docker compose up` provides both. The Kafka listener is disabled in the test profile, so no
+broker is required.
 
 ---
 
@@ -208,6 +208,11 @@ Each of these was a choice with a trade-off rather than a default, and each is w
   delivery always succeeds and throws when it doesn't, so the failure policy lives in one place
   and a permanently broken merchant endpoint lands in a dead-letter topic instead of blocking the
   partition forever.
+- **The webhook client has explicit timeouts.** An endpoint that hangs rather than failing would
+  never throw, so no retry would fire, nothing would reach the dead letter, and every merchant
+  behind that record on the partition would wait with it.
+- **`sslmode` is a variable, defaulting to `prefer`.** The driver tries TLS and falls back, so one
+  image runs against a local Postgres that doesn't offer it and a managed one that demands it.
 - **Tests are integration tests deliberately.** A mocked unit test of the service layer passes
   happily while the security config is wide open.
 - **One artifact, three environments.** Every external address is `${VAR:default}`, so the same
@@ -219,20 +224,21 @@ Each of these was a choice with a trade-off rather than a default, and each is w
 
 Stated rather than discovered:
 
-- **Tests require a live Kafka broker.** Every `@SpringBootTest` starts the `@KafkaListener`
-  against `localhost:9092`, and CI has no broker, so the pipeline is currently unreliable.
-  `spring.kafka.listener.auto-startup: false` in the test profile closes it.
 - **The event pipeline is local-only.** Render offers no managed Kafka and the development
   network blocks Aiven at DNS, so the deployed instance accumulates unpublished outbox rows.
 - **`@Scheduled` runs on every instance.** Two copies of the app would sweep the same rows
   simultaneously. `SELECT ... FOR UPDATE SKIP LOCKED` or ShedLock is the fix.
 - **Webhook delivery is at-least-once with no event id**, so merchants have nothing to
   deduplicate on. Stripe includes one for exactly this reason.
-- **The webhook consumer and dead-letter path are untested.** Verified by hand, not by CI.
+- **The dead-letter path is untested.** Verified by hand, not by CI.
 - **Outbox rows and idempotency keys are never deleted.** Two slow leaks, both fixable with a
   scheduled cleanup.
 - **A stranded payment isn't recoverable by retry.** The reconciler resolves it, but the
   idempotency key means a retry returns the stranded payment rather than starting fresh.
+- **The database is no longer on the app's private network.** Postgres moved to Neon, so every
+  query crosses the public internet under TLS — safe, slightly slower, one more provider in the
+  failure path. Neon also scales to zero after five minutes idle, so the first query after a
+  quiet spell pays a wake-up on top of Render's own cold start.
 - **Unauthenticated traffic isn't rate limited.** The filter needs an identity to count against,
   so `/auth/login` has no ceiling. Production gateways add an IP-keyed limiter.
 - **Fixed-window rate limiting allows a boundary burst** — 20 either side of a minute boundary is
@@ -253,7 +259,6 @@ Stated rather than discovered:
 - **Dependency CVEs are unaudited.** Spring Boot 3.4.1 pulls transitive versions with known
   advisories.
 
-
 ---
 
 ## Docs
@@ -263,7 +268,7 @@ Stated rather than discovered:
 - [`docs/WORKLOG.md`](docs/WORKLOG.md) — daily entries: what was built, why, what broke, what it
   taught
 - [`docs/architecture.md`](docs/architecture.md) — versioned architecture with diagrams, currently
-  v1.6
+  v1.7
 - [`docs/CONTEXT.md`](docs/CONTEXT.md) — the full current state of the project in one file
 
 ---
@@ -272,9 +277,7 @@ Stated rather than discovered:
 
 **Next, in order of how much they matter:**
 
-- `spring.kafka.listener.auto-startup: false` in the test profile, so CI stops depending on a
-  broker that only one test cares about
-- Tests for `WebhookConsumer` and the dead-letter path
+- A test for the dead-letter path
 - An event id in the webhook payload, so merchants can deduplicate an at-least-once delivery
 - Scheduled cleanup for published outbox rows and expired idempotency keys
 - `PATCH /api/v1/merchants/me` to set `webhook_url` through the API rather than through psql

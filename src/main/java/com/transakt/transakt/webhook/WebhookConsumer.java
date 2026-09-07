@@ -18,6 +18,13 @@ import java.util.Optional;
  * retries and the dead-letter topic; this method is written as if it always
  * succeeds. A merchant whose server is down blocks nothing — the retries happen
  * on the consumer's thread, never on the payment request thread.
+ *
+ * The RestClient is injected rather than created here, and the bean that supplies
+ * it sets connect and read timeouts. Without them, a merchant endpoint that accepts
+ * the connection and then never answers would block this thread indefinitely: no
+ * exception, so no retry, so nothing reaches the dead-letter topic, and every
+ * record behind it on the partition waits too. The retry policy protects against
+ * endpoints that fail. Only a timeout protects against endpoints that hang.
  */
 @Slf4j
 @Component
@@ -25,11 +32,14 @@ public class WebhookConsumer {
 
     private final MerchantRepository merchantRepository;
     private final ObjectMapper objectMapper;
-    private final RestClient restClient = RestClient.create();
+    private final RestClient restClient;
 
-    public WebhookConsumer(MerchantRepository merchantRepository, ObjectMapper objectMapper) {
+    public WebhookConsumer(MerchantRepository merchantRepository,
+                           ObjectMapper objectMapper,
+                           RestClient webhookRestClient) {
         this.merchantRepository = merchantRepository;
         this.objectMapper = objectMapper;
+        this.restClient = webhookRestClient;
     }
 
     @KafkaListener(topics = "${outbox.topic}", groupId = "transakt-webhooks")

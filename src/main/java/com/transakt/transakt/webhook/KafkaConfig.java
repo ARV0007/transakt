@@ -6,7 +6,9 @@ import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.listener.DeadLetterPublishingRecoverer;
 import org.springframework.kafka.listener.DefaultErrorHandler;
 import org.springframework.util.backoff.FixedBackOff;
-
+import org.springframework.http.client.SimpleClientHttpRequestFactory;
+import org.springframework.web.client.RestClient;
+import java.time.Duration;
 @Configuration
 public class KafkaConfig {
 
@@ -21,5 +23,12 @@ public class KafkaConfig {
         return new DefaultErrorHandler(
                 new DeadLetterPublishingRecoverer(kafkaTemplate),
                 new FixedBackOff(2000L, 2L));
+    }
+    @Bean
+    public RestClient webhookRestClient(RestClient.Builder builder) {
+        SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
+        factory.setConnectTimeout(Duration.ofSeconds(3));
+        factory.setReadTimeout(Duration.ofSeconds(5));
+        return builder.requestFactory(factory).build();
     }
 }
