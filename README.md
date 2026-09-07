@@ -32,7 +32,7 @@ curl -s https://transakt.onrender.com/api/v1/health
 | **Reconciliation** | A bank call that times out leaves a payment `PENDING`, not `FAILED` — you don't know whether the bank acted. A scheduled sweep asks and settles. |
 | **Transactional outbox** | The `payment.settled` event row commits with the payment. Either both exist or neither does, so an event cannot be lost. |
 | **Kafka + webhooks** | A publisher sweeps unpublished events to Kafka; a consumer delivers them to the merchant with retries and a dead-letter topic. |
-| **29 tests** | 27 integration tests through the full filter chain against a real database, plus 2 unit tests where the behaviour needs a dependency to fail on demand. |
+| **32 tests** | 25 integration tests through the full filter chain against a real database, plus 7 unit tests where the behaviour needs a dependency to fail on demand. |
 
 ---
 
@@ -156,7 +156,7 @@ database at startup, so there is no setup SQL to run and nothing to configure.
 ./mvnw test
 ```
 
-Twenty-nine tests, about twenty-five seconds. Needs Postgres and Redis reachable on localhost —
+Thirty-two tests, about twenty-five seconds. Needs Postgres and Redis reachable on localhost —
 `docker compose up` provides both. The Kafka listener is disabled in the test profile, so no
 broker is required.
 

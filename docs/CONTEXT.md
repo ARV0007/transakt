@@ -67,7 +67,7 @@ That is deliberate — a container that starts in two seconds and can be thrown 
 shared remote database, and the parameterised config means the same image works against either.
 
 **To run everything locally:** `docker compose up` — Postgres, Redis, Kafka and the app.
-**To run the tests:** all three stores up, then `./mvnw test`. Expect 29 tests, ~25 seconds.
+**To run the tests:** all three stores up, then `./mvnw test`. Expect 32 tests, ~25 seconds.
 **Before running the app bare:** `lsof -ti :8080 | xargs kill` — a leftover instance is the usual
 cause of "port already in use", and a failed startup means Flyway never ran.
 
@@ -316,8 +316,9 @@ src/test/java/com/transakt/transakt
 ├── DeclinedPaymentIntegrationTest                                          (1)
 ├── ReconcilerIntegrationTest                                               (2)
 ├── OutboxIntegrationTest                                                   (2)
-└── OutboxPublisherTest                unit — mocked KafkaTemplate          (3)
-                                                                    total = 29
+├── OutboxPublisherTest                unit — mocked KafkaTemplate          (3)
+└── WebhookConsumerTest                unit — MockRestServiceServer         (3)
+                                                                    total = 32
 
 src/test/resources/application-test.yaml    the `test` profile
 ```
@@ -404,9 +405,10 @@ The Neon database, built empty on Day 23, reports eight.
   is what keeps both true.
 - **The Kafka listener is disarmed in tests** (Day 23). `auto-startup: false` creates the
   listener container and leaves it stopped. Nothing loses coverage — the only publishing test is
-  a unit test with a mocked template, and no test covers the consumer at all.
+  a unit test with a mocked template, and since Day 24 the consumer is pinned by a unit test that
+  intercepts its `RestClient` instead of needing a broker.
 - **Tests are integration tests, deliberately** — the interesting behaviour lives in the wiring.
-  The two unit tests exist because both pin behaviour that needs a dependency to **fail on
+  The three unit tests exist because each pins behaviour that needs a dependency to **fail on
   demand**, which a mock does cleanly and a real store does not.
 - **Decline rate is set explicitly in tests**, never left random. Random is a feature by hand and
   a defect in CI. That explicitness is also what kept the two payment tests correct through three
@@ -671,13 +673,14 @@ All authenticated endpoints are rate limited to 20 requests per merchant per min
 **Feature work is done and the infrastructure is settled.** Payment gateway, two auth doors,
 double-entry ledger, ownership, idempotency, rate limiting, bank simulator, two-transaction
 settlement, reconciler, outbox, Kafka publisher, webhook consumer with retries and a DLQ.
-29 tests, CI green in under a minute, database on a tier that doesn't expire.
+32 tests, CI green in under a minute, database on a tier that doesn't expire.
 
 **Nothing is currently broken.** No dates on the calendar.
 
 **In order of value:**
 
-- Tests for `WebhookConsumer` and the dead-letter path — the only proof today is a manual run
+- A test for the dead-letter path — `WebhookConsumer` is pinned since Day 24, but the hand-off to
+  `payment.settled-dlt` after the retries run out is still proved only by a manual run
 - An event id in the webhook payload so merchants can deduplicate an at-least-once delivery
 - Scheduled cleanup for published outbox rows and expired idempotency keys (two slow leaks)
 - `PATCH /api/v1/merchants/me` to set `webhook_url` through the API instead of psql
