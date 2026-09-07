@@ -92,13 +92,18 @@ public class PaymentService {
 
         // Written in THIS transaction, alongside the payment it describes. Either both
         // commit or neither does, so an event can never be lost.
-        outboxEventRepository.save(new OutboxEvent(
-                settled.getId(),
-                "payment.settled",
-                """
-                {"paymentId":"%s","merchantId":"%s","status":"%s","amountPaise":%d,"currency":"%s"}"""
-                        .formatted(settled.getId(), settled.getMerchantId(), settled.getStatus(),
-                                settled.getAmountPaise(), settled.getCurrency())));
+        OutboxEvent event = new OutboxEvent(settled.getId(), "payment.settled");
+
+        // eventId is this row's own primary key, never a fresh UUID. Delivery is
+        // at-least-once, so the merchant may receive this event twice; the id is what
+        // lets them tell a duplicate from a second payment. A new id per send would
+        // deduplicate nothing and would look like it did.
+        event.setPayload("""
+                {"eventId":"%s","paymentId":"%s","merchantId":"%s","status":"%s","amountPaise":%d,"currency":"%s"}"""
+                .formatted(event.getId(), settled.getId(), settled.getMerchantId(),
+                        settled.getStatus(), settled.getAmountPaise(), settled.getCurrency()));
+
+        outboxEventRepository.save(event);
         return settled;
     }
 

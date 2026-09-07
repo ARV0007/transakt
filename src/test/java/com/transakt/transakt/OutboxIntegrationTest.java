@@ -115,4 +115,23 @@ class OutboxIntegrationTest {
         assertThat(events).hasSize(1);
         assertThat(events.get(0).getPayload()).contains("FAILED");
     }
+
+    /**
+     * The id in the payload must BE the outbox row's primary key.
+     *
+     * This is the assertion that catches the regression: build the payload from a
+     * fresh UUID and every other test in this file still passes, because they only
+     * check that an event was written. Only comparing the two ids notices.
+     */
+    @Test
+    void theEventIdInThePayloadIsTheOutboxRowsOwnId() throws Exception {
+        Payment pending = pendingPayment(merchantIdFor("outbox-eventid@shop.com"));
+
+        paymentService.settle(pending.getId(), true);
+
+        OutboxEvent event = outboxEventRepository.findByPublishedAtIsNullOrderByCreatedAtAsc().get(0);
+        String eventIdInPayload = objectMapper.readTree(event.getPayload()).get("eventId").asText();
+
+        assertThat(eventIdInPayload).isEqualTo(event.getId());
+    }
 }

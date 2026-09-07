@@ -40,7 +40,9 @@ class OutboxPublisherTest {
     }
 
     private OutboxEvent anEvent() {
-        return new OutboxEvent("payment-123", "payment.settled", "{\"status\":\"CAPTURED\"}");
+        OutboxEvent event = new OutboxEvent("payment-123", "payment.settled");
+        event.setPayload("{\"eventId\":\"" + event.getId() + "\",\"status\":\"CAPTURED\"}");
+        return event;
     }
 
     @Test
