@@ -1,5 +1,7 @@
 package com.transakt.transakt.merchant;
 
+import jakarta.validation.Valid;
+import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
@@ -17,6 +19,20 @@ public class MerchantController {
     @PostMapping
     public Merchant create(@RequestBody Merchant merchant) {
         return merchantService.create(merchant);
+    }
+
+    /**
+     * "me" is not a path variable, and that is the entire design.
+     *
+     * There is no id in this route for a client to change, so "merchant A edits
+     * merchant B" is not a request that can be expressed - the same reasoning that
+     * removed merchantId from CreatePaymentRequest on Day 9. The identity comes from
+     * the credential, which both auth filters resolve to the merchant id.
+     */
+    @PatchMapping("/me")
+    public Merchant updateMyWebhook(Authentication authentication,
+                                    @Valid @RequestBody UpdateWebhookRequest request) {
+        return merchantService.updateWebhookUrl(authentication.getName(), request.getWebhookUrl());
     }
 
     @GetMapping("/{id}")
