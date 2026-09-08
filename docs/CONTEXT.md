@@ -67,7 +67,7 @@ That is deliberate — a container that starts in two seconds and can be thrown 
 shared remote database, and the parameterised config means the same image works against either.
 
 **To run everything locally:** `docker compose up` — Postgres, Redis, Kafka and the app.
-**To run the tests:** all three stores up, then `./mvnw test`. Expect 32 tests, ~25 seconds.
+**To run the tests:** all three stores up, then `./mvnw test`. Expect 41 tests, ~25 seconds.
 **Before running the app bare:** `lsof -ti :8080 | xargs kill` — a leftover instance is the usual
 cause of "port already in use", and a failed startup means Flyway never ran.
 
@@ -155,7 +155,7 @@ until Day 23, which nested it under `ratelimit:` and made it invisible.
 
 ---
 
-## Current state: Day 23 complete — feature work done, infrastructure settled
+## Current state: Day 24 complete — feature work done, infrastructure settled
 
 | Day | What was built |
 |-----|----------------|
@@ -184,8 +184,9 @@ until Day 23, which nested it under `ratelimit:` and made it invisible.
 | 21 | **Kafka in compose (KRaft)**, `OutboxPublisher`, `WebhookConsumer`, `KafkaConfig` with retries and a DLT, `merchants.webhook_url` (V8) |
 | 22 | **End-to-end verification** of the retry and dead-letter path; docs to v1.6 |
 | 23 | **Kafka listener disarmed in tests** so CI no longer needs a broker; **misplaced `bank:` block** in the test profile found and fixed (suite twice as fast, decisions deterministic); **Postgres moved to Neon**, `sslmode` parameterised |
+| 24 | **Docs corrected** — the test count was wrong in five places, and both halves of "27 integration plus 2 unit" were wrong too; **`eventId` in the webhook payload** carrying the outbox row's primary key, three-argument `OutboxEvent` constructor deleted so the two cannot diverge; **`RetentionSweeper`** — hourly, seven-day outbox and 24-hour idempotency windows, `@Modifying @Query` deletes, V9 indexes; **`PATCH /api/v1/merchants/me`** with format validation, a security matcher above the ADMIN rule, and the SSRF exposure documented |
 
-Architecture doc is at **v1.7**.
+Architecture doc is at **v1.8**.
 
 **Verified working in production (7 Sep, on Neon):**
 `GET /health` returns `{"status":"UP","service":"transakt"}` ·
@@ -276,9 +277,10 @@ com.transakt.transakt
 │               InvalidCredentialsException, ApiKeyFilter, ApiKeyHasher,
 │               RateLimitFilter, SecurityConfig, PasswordConfig, WebConfig,
 │               RateLimitService, IdempotencyService, IdempotencyKey (entity),
-│               IdempotencyKeyRepository
+│               IdempotencyKeyRepository, RetentionSweeper (hourly, @Modifying deletes)
 │               IdempotencyConflictException was DELETED in v1.4 — unreachable
-├── merchant/   Merchant (entity, has webhookUrl since V8), MerchantRole (enum),
+├── merchant/   Merchant (entity, has webhookUrl since V8), UpdateWebhookRequest (DTO),
+│               MerchantRole (enum),
 │               MerchantRepository, MerchantService, MerchantController
 ├── payment/    Payment, PaymentStatus (PENDING / CAPTURED / FAILED),
 │               CreatePaymentRequest (DTO), PaymentRepository,
@@ -303,7 +305,9 @@ src/main/resources/db/migration
 ├── V5__add_idempotency_keys.sql        table + UNIQUE (merchant_id, idempotency_key), FK to payments
 ├── V6__add_pending_payments_index.sql  partial: payments (created_at) WHERE status = 'PENDING'
 ├── V7__add_outbox_events.sql           table + partial index WHERE published_at IS NULL
-└── V8__add_merchant_webhook_url.sql    merchants.webhook_url VARCHAR(512), nullable
+├── V8__add_merchant_webhook_url.sql    merchants.webhook_url VARCHAR(512), nullable
+└── V9__add_retention_indexes.sql       plain indexes for the sweeper — outbox_events
+                                        (published_at), idempotency_keys (created_at)
 
 src/test/java/com/transakt/transakt
 ├── TransaktApplicationTests           smoke test — the context loads       (1)
@@ -315,10 +319,12 @@ src/test/java/com/transakt/transakt
 ├── ApprovedPaymentIntegrationTest                                          (1)
 ├── DeclinedPaymentIntegrationTest                                          (1)
 ├── ReconcilerIntegrationTest                                               (2)
-├── OutboxIntegrationTest                                                   (2)
+├── OutboxIntegrationTest                                                   (3)
+├── RetentionSweeperIntegrationTest                                         (3)
+├── MerchantWebhookIntegrationTest                                          (5)
 ├── OutboxPublisherTest                unit — mocked KafkaTemplate          (3)
 └── WebhookConsumerTest                unit — MockRestServiceServer         (3)
-                                                                    total = 32
+                                                                    total = 41
 
 src/test/resources/application-test.yaml    the `test` profile
 ```
@@ -442,6 +448,7 @@ The Neon database, built empty on Day 23, reports eight.
 | GET | `/api/v1/health` | open |
 | POST | `/api/v1/auth/login` | open |
 | POST | `/api/v1/merchants` | open (bootstrap: signup) — response carries the API key **once** |
+| PATCH | `/api/v1/merchants/me` | authenticated; sets the **caller's own** `webhook_url` — no id in the route |
 | GET/PUT/DELETE | `/api/v1/merchants/**` | requires `ROLE_ADMIN` |
 | POST | `/api/v1/payments` | authenticated; merchant from the token; optional `Idempotency-Key` |
 | GET | `/api/v1/payments` | authenticated; **scoped to the caller**, all rows for admins; **paginated** |
@@ -454,8 +461,13 @@ page sorted by `createdAt` descending. The response is
 
 All authenticated endpoints are rate limited to 20 requests per merchant per minute.
 
-**There is no endpoint to set `webhook_url`.** It is set directly in the database:
-`UPDATE merchants SET webhook_url = '...' WHERE email = '...';`
+`PATCH /api/v1/merchants/me` takes `{"webhookUrl": "https://..."}` and returns the updated
+merchant. Sending `null` clears it, which is how delivery is turned off. The URL is **format
+validated only** — `^https?://\S+$`, max 512 — which rejects `ftp://` and accepts
+`http://169.254.169.254/`. See the SSRF item under What's next.
+
+There is still no `GET /api/v1/merchants/me`, so a merchant can write the value but not read it
+back.
 
 ---
 
@@ -630,7 +642,7 @@ All authenticated endpoints are rate limited to 20 requests per merchant per min
   `application.yaml`'s defaults. Postgres.app trusts local connections without a password;
   the CI container demands one. A step-level `DB_PASSWORD` closes it.
 - **The runner's database is empty and the test profile sets `baseline-on-migrate: false`**, so
-  every push executes V1–V8 as real SQL. That's the proof the migrations work on a machine that
+  every push executes V1–V9 as real SQL. That's the proof the migrations work on a machine that
   has never seen the project.
 
 **Terminal and workflow**
@@ -673,18 +685,24 @@ All authenticated endpoints are rate limited to 20 requests per merchant per min
 **Feature work is done and the infrastructure is settled.** Payment gateway, two auth doors,
 double-entry ledger, ownership, idempotency, rate limiting, bank simulator, two-transaction
 settlement, reconciler, outbox, Kafka publisher, webhook consumer with retries and a DLQ.
-32 tests, CI green in under a minute, database on a tier that doesn't expire.
+41 tests, CI green in under a minute, database on a tier that doesn't expire.
 
 **Nothing is currently broken.** No dates on the calendar.
 
 **In order of value:**
 
+- **BLOCKS DEPLOYING KAFKA — refuse private and link-local addresses in `WebhookConsumer`.** A
+  merchant can set `webhook_url` to `http://169.254.169.254/latest/meta-data/` and the format
+  validation accepts it, along with `http://localhost:5432` and anything on the private network.
+  Signup is open, so anyone can register and set one. Harmless *only* because no broker is
+  deployed and the consumer never runs. The check must be at delivery time on the resolved
+  address: a write-time check can be true when saved and false when called, because whoever owns
+  the hostname controls its DNS record. Close this before Kafka goes anywhere near production.
 - A test for the dead-letter path — `WebhookConsumer` is pinned since Day 24, but the hand-off to
   `payment.settled-dlt` after the retries run out is still proved only by a manual run
-- An event id in the webhook payload so merchants can deduplicate an at-least-once delivery
-- Scheduled cleanup for published outbox rows and expired idempotency keys (two slow leaks)
-- `PATCH /api/v1/merchants/me` to set `webhook_url` through the API instead of psql
-- `SELECT ... FOR UPDATE SKIP LOCKED` or ShedLock, so the two schedulers survive a second instance
+- `GET /api/v1/merchants/me`, so a merchant can read back the webhook URL they just set
+- `SELECT ... FOR UPDATE SKIP LOCKED` or ShedLock, so the three schedulers survive a second
+  instance — publisher, reconciler and now the retention sweeper
 
 **Smaller, still outstanding:**
 
@@ -701,8 +719,6 @@ settlement, reconciler, outbox, Kafka publisher, webhook consumer with retries a
 - **The API key prefix carries ~20 bits of entropy** — `tk_` eats three of eight characters
 - `OwnershipIntegrationTest` survived the list endpoint changing shape, so its assertions
   aren't structural
-- A Spring Security warning about a generated password and an `inMemoryUserDetailsManager`
-  appears at startup — harmless, but odd for an app with its own two auth doors. Unexamined.
 - Five Redis repository-scanning WARNs on every boot, because `spring-boot-starter-data-redis`
   tries to claim the JPA repositories. Fixable with one annotation.
 - **Dependency CVEs are unaudited.** Spring Boot 3.4.1 pulls transitive versions with known

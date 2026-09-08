@@ -1,6 +1,6 @@
 # Transakt Architecture
 
-## Current: v1.7 — the database moves off-platform (Days 13–23)
+## Current: v1.8 — event ids, retention, and a merchant-writable webhook URL (Days 13–24)
 
 **Live at https://transakt.onrender.com**
 
@@ -14,9 +14,9 @@ flowchart TD
   app -->|public internet - TLS required, sslmode=require| pg[(Neon - PostgreSQL 18.6 - Singapore - scales to zero)]
   app -->|private network - no TLS needed| kv[(transakt-redis - Valkey 8 - Singapore)]
   gh[GitHub ARV0007/transakt - branch main] -->|Auto-Deploy on push| build[Render build - multi-stage Dockerfile]
-  gh -->|push or pull request| ci[GitHub Actions - thirty-two tests against service containers]
+  gh -->|push or pull request| ci[GitHub Actions - forty-one tests against service containers]
   build --> app
-  flyway[Flyway V1-V8 - runs at container startup, before Hibernate validates] -.-> pg
+  flyway[Flyway V1-V9 - runs at container startup, before Hibernate validates] -.-> pg
   note[Kafka is NOT deployed - it runs only in docker-compose locally] -.-> app
 ```
 
@@ -65,7 +65,7 @@ flowchart TD
   pend --> db[(PostgreSQL)]
   settle --> db
   oer --> db
-  flyway[Flyway V1-V8 - runs once at startup, before Hibernate validates] -.-> db
+  flyway[Flyway V1-V9 - runs once at startup, before Hibernate validates] -.-> db
 ```
 
 **How a request flows:** Tomcat parses the HTTP request. Three filters run before any controller. `JwtAuthFilter` looks for an `Authorization: Bearer` header and, if the signature verifies and the token has not expired, records the caller's merchant ID and role in the SecurityContext with no database access. `ApiKeyFilter` then looks for `X-API-Key` and, if the context is still empty, takes the key's first eight characters as a lookup prefix, finds the single matching merchant row through a unique index, and compares the SHA-256 of the whole key against the stored hash before recording the same identity. `RateLimitFilter` runs last of the three — deliberately, because it needs an identity to count against — and refuses the request outright with 429 if that merchant has exceeded its per-minute allowance. The DispatcherServlet then routes to a controller. Controllers read the caller's identity from the SecurityContext and hand services plain values, so services stay free of Spring Security types. Creating a payment is no longer one transaction: `PaymentProcessor` opens one to record the attempt, closes it, calls the bank, then opens a second to record the outcome. Each half is still atomic — the payment row and its idempotency key together, then the final status, both ledger entries and the outbox event together — but the two halves are not atomic with each other, and that is deliberate.
@@ -128,7 +128,11 @@ Three properties carry the weight.
 
 The honest limit is **at-least-once**. If the send succeeds but the process dies before the stamp commits, the next sweep publishes again. Two systems cannot be made atomic; you choose which side to fail on, and sending twice beats losing it. Consumers must tolerate duplicates.
 
-**Webhook delivery (v1.6):** `WebhookConsumer` is a `@KafkaListener` on `payment.settled`, consumer group `transakt-webhooks`. It reads `merchantId` from the payload, looks up the merchant's `webhook_url` (`V8`, nullable — a merchant without one is simply not called), and POSTs the payload.
+**Retention (v1.8):** `RetentionSweeper` runs hourly and deletes published outbox rows older than seven days and idempotency keys older than twenty-four hours. The two windows are different kinds of thing: the outbox is a queue rather than an archive, so a published row's remaining value is a debugging window, while the idempotency window is a promise to merchants — reuse a key inside it and you get the original payment back, after it the same key starts a new payment. Both are constants rather than configuration, because a promise that varies by environment is not a promise.
+
+Two details carry the weight. The predicate is `published_at IS NOT NULL AND published_at < :cutoff`, never a predicate on age alone: an old *unpublished* row is a merchant who was never told their payment settled, and it is also the oldest row in the table, so `WHERE created_at < :cutoff` would delete exactly the events that still matter. And the deletes are `@Modifying @Query` rather than derived `deleteByX` methods, which Spring Data implements as a SELECT of every matching row followed by one DELETE each — the worst possible shape on a table being cleaned because it grew. V9 adds plain indexes on `outbox_events (published_at)` and `idempotency_keys (created_at)`; plain rather than partial, because a partial index pays off when its predicate selects a minority and published rows are nearly the whole table.
+
+**Webhook delivery (v1.6):** `WebhookConsumer` is a `@KafkaListener` on `payment.settled`, consumer group `transakt-webhooks`. It reads `merchantId` from the payload, looks up the merchant's `webhook_url` (`V8`, nullable — a merchant without one is simply not called), and POSTs the payload. Since v1.8 the payload carries an `eventId`: the outbox row's own primary key, assigned inside the payment transaction, so every redelivery of that row carries the same id and a merchant can deduplicate an at-least-once delivery. An id generated at publish time would change on every retry and be worse than none, because merchants would trust it.
 
 `merchantId` was added to the event payload for this. The consumer could have queried the payments table, but a consumer reading the producer's database is exactly what events exist to avoid. **An event carries everything its consumer needs.**
 
@@ -184,7 +188,7 @@ Two trade-offs came with it, and both are real. Every query now crosses the publ
 
 **Continuous integration (Day 15):** `.github/workflows/ci.yml` runs the full suite on every push and every pull request to `main`. The runner starts `postgres:18` and `redis:8-alpine` as health-checked service containers, sets up Temurin 21 with a cached Maven repository, and runs `./mvnw test` — under a minute, green on the first run. The one real catch was invisible until both config files were read against each other: `application-test.yaml` sets only the JDBC URL, so username and password fall through to `application.yaml`'s defaults, and Postgres.app trusts local connections without a password while the container demands one. A step-level `DB_PASSWORD` closes it.
 
-What CI proves goes beyond the assertions. The runner's database is empty and the test profile sets `baseline-on-migrate: false`, so V1 through V8 execute as real SQL on every push and Hibernate then validates the result against the entity mappings. **Every push is a proof that the migrations build a working schema on a machine that has never seen this project.**
+What CI proves goes beyond the assertions. The runner's database is empty and the test profile sets `baseline-on-migrate: false`, so V1 through V9 execute as real SQL on every push and Hibernate then validates the result against the entity mappings. **Every push is a proof that the migrations build a working schema on a machine that has never seen this project.**
 
 **The Kafka listener is disarmed in tests (Day 23).** v1.6 left a trap: every `@SpringBootTest` starts the `@KafkaListener`, which connects to `localhost:9092`, and the CI runner has no broker. The pipeline had not gone red yet — a listener that cannot reach a broker retries in the background without failing the context — but it was one timeout away from doing so. `spring.kafka.listener.auto-startup: false` in the test profile creates the listener container and leaves it stopped. Nothing loses coverage: the only test that exercises publishing is a unit test with a mocked `KafkaTemplate`, and the consumer — untested at the time, pinned by `WebhookConsumerTest` since Day 24 — never needed a live listener either.
 
@@ -214,7 +218,7 @@ SHA-256 rather than BCrypt is deliberate. Slow hashing defends against guessable
 
 The migration was performed as **expand and contract** across four steps: add the columns nullable and backfill them, start writing them on every signup, switch the reader, then enforce `NOT NULL` and drop the old column. Between the first and last step the database supported both shapes, so no intermediate state could lose data, and the only irreversible step was last and isolated. Two orderings inside that sequence are easy to get backwards and both matter: writers must switch before readers, or a merchant created in between has a key but no hash; and `NOT NULL` belongs to the contract phase, because during expand the entity does not yet map the columns and every insert would write null.
 
-**The test suite (v1.1, thirty-two tests):** twenty-five integration tests plus seven unit tests across three classes, running against the full stack in about twenty-five seconds since the Day 23 config fix. `AuthIntegrationTest` covers signup, login and both failure paths. `OwnershipIntegrationTest` covers foreign payments and ledgers returning 404, list scoping, and the forged `merchantId` being ignored. `IdempotencyIntegrationTest` covers key reuse, key scoping per merchant, and the deliberate decision not to fingerprint the request body. `RateLimitIntegrationTest` covers the 429 threshold and the fact that one merchant hitting the ceiling does not affect another. All use `MockMvc`, which sends real requests through the entire filter chain and into a real database without opening a network port.
+**The test suite (v1.1, forty-one tests since v1.8):** thirty-four integration tests plus seven unit tests across three classes, running against the full stack in about twenty-five seconds since the Day 23 config fix. `AuthIntegrationTest` covers signup, login and both failure paths. `OwnershipIntegrationTest` covers foreign payments and ledgers returning 404, list scoping, and the forged `merchantId` being ignored. `IdempotencyIntegrationTest` covers key reuse, key scoping per merchant, and the deliberate decision not to fingerprint the request body. `RateLimitIntegrationTest` covers the 429 threshold and the fact that one merchant hitting the ceiling does not affect another. `RetentionSweeperIntegrationTest` covers both retention windows and, most importantly, that an unpublished outbox row survives the sweep however old it is. `MerchantWebhookIntegrationTest` covers setting and clearing the webhook URL, the rejected scheme, and both routes by which a merchant might try to reach another merchant's row. Most use `MockMvc`, which sends real requests through the entire filter chain and into a real database without opening a network port.
 
 All five idempotency tests passed **unchanged** through the v1.4 rewrite, while the entire storage layer beneath them was replaced. That is the payoff for testing through the front door rather than mocking the service: the tests describe the contract, so they survive any implementation that still honours it.
 
@@ -280,11 +284,11 @@ Idempotency takes the opposite answer for the opposite reason, and the asymmetry
 
 - **The event pipeline is local-only.** Kafka runs in docker-compose; Render has no broker and the development network blocks Aiven at DNS. The deployed instance accumulates unpublished outbox rows.
 - **`@Scheduled` runs on every instance.** `PaymentReconciler` and `OutboxPublisher` both sweep on every running copy of the app. One instance on Render today, so it works; two would sweep the same rows simultaneously. `SELECT ... FOR UPDATE SKIP LOCKED` or ShedLock is the fix.
-- **Webhook delivery is at-least-once with no event id.** A duplicate send is possible and merchants have nothing to deduplicate on. Stripe includes an event id for exactly this; Transakt does not.
+- **Webhook delivery is at-least-once.** A duplicate send happens whenever the publisher dies between a successful send and the `published_at` stamp. Since v1.8 the payload carries an `eventId` — the outbox row's primary key, identical on every redelivery — so merchants *can* deduplicate, but nothing verifies that they do. The guarantee is theirs to enforce.
 - **The dead-letter path is untested.** `WebhookConsumer` itself is pinned by three unit tests since Day 24, but the hand-off to `payment.settled-dlt` once the retries are exhausted is still verified by hand, not by CI.
 - **A stranded payment is still not fully recoverable by retry.** The reconciler resolves it, but the idempotency key written in transaction one means a retry with the same key returns the stranded payment rather than starting a fresh attempt.
-- **Outbox rows are never deleted.** Published events accumulate forever, same shape of leak as the idempotency keys.
-- **Idempotency keys never expire.** Redis expired them after 24 hours for free; Postgres has no TTL. Rows accumulate indefinitely, growing the table and its unique index without bound. A scheduled delete of rows older than 24 hours is the fix — until then this is a slow leak, traded knowingly for durability.
+- **Published outbox rows are kept for seven days, then deleted** by `RetentionSweeper` (v1.8). Unpublished rows are never deleted at any age, deliberately: an old unpublished row is a merchant who was never told their payment settled, and it is also the oldest row in the table.
+- **An idempotency key stops being honoured after 24 hours.** `RetentionSweeper` (v1.8) restores the expiry Redis provided for free and that Day 17 silently lost when the keys moved into Postgres, which has no TTL. The consequence is a behaviour rather than housekeeping: past the window, the same key starts a new payment. That is the window Stripe publishes too.
 - **The idempotency race path is untested.** `IdempotencyIntegrationTest` is `@Transactional`, so a constraint violation would poison the test's own transaction and the recovery block never runs. It does not fire in practice either, because the lookup catches duplicates before any insert is attempted. Exercising it needs two genuinely concurrent requests against a committed database.
 - **The database is no longer on the same private network as the app (v1.7).** Every query crosses the public internet under TLS rather than staying inside Render's Singapore network. Correctness is unaffected and `sslmode=require` makes it safe, but latency is worse than a private hop and there is one more provider in the failure path.
 - **Neon scales compute to zero after five minutes idle.** The first query after a quiet period pays a wake-up cost on top of Render's own cold start. Fine for a demo, wrong for anything with real traffic.
@@ -301,7 +305,8 @@ Idempotency takes the opposite answer for the opposite reason, and the asymmetry
 - **Signup does not require a password.** The hashing step is guarded on the field being non-null, so a merchant can be created that can never log in. `@NotBlank` on the request would close it.
 - **No merchant-scoped ledger listing.** Ledger entries are reachable only through their parent payment.
 - **There is no ADMIN account on the deployed instance.** Role is server-controlled at signup, so every merchant created through the public API is a MERCHANT and `/api/v1/merchants/**` is unreachable in production. Correct behaviour, but it means the admin paths are only exercised locally and by the test suite.
-- **There is no endpoint to set `webhook_url`.** It is set directly in the database. A `PATCH /api/v1/merchants/me` would close it.
+- **A merchant can write `webhook_url` but not read it back.** `PATCH /api/v1/merchants/me` exists as of v1.8; there is no matching `GET`, so confirming the stored value still needs an admin.
+- **A webhook URL is an SSRF vector and is only format-validated.** `^https?://` rejects `ftp://` and accepts `http://169.254.169.254/latest/meta-data/`, the cloud instance-metadata endpoint, along with anything on the private network. Signup is `permitAll`, so anyone can register and set one. Resolving the host at write time does not fix it — DNS rebinding means a name that resolves publicly when saved can resolve to `127.0.0.1` when called — so the check belongs in `WebhookConsumer`, against the address actually connected to. Not currently exploitable because no broker is deployed and the consumer never runs, which makes this a **blocker on deploying Kafka** rather than a live hole.
 - `POST /api/v1/merchants` returns 200; REST convention is 201 with a `Location` header. There is no password-change endpoint and no `Retry-After` on 429s.
 
 ## Version log
@@ -324,3 +329,4 @@ Idempotency takes the opposite answer for the opposite reason, and the asymmetry
 | v1.5 | 18 | A `BankClient` port with a fake adapter; payment creation split into two transactions with the bank call in the gap; ledger entries written only on approval; `PENDING` becomes a real state. |
 | v1.6 | 19–22 | Reconciler for stranded payments; transactional outbox; scheduled Kafka publisher stamping only on confirmation; webhook consumer with retry and a dead-letter topic; Kafka in docker-compose under KRaft. |
 | **v1.7** | **23** | **Kafka listener disarmed in tests so CI no longer needs a broker; a misplaced `bank:` block in the test profile found and fixed, making bank decisions deterministic and the suite twice as fast; PostgreSQL moved from expiring Render free tier to Neon, with `sslmode` parameterised so one artifact still runs in three places.** |
+| **v1.8** | **24** | **`eventId` in the webhook payload, carrying the outbox row's primary key so an at-least-once redelivery can be deduplicated; hourly retention sweep for published outbox rows and expired idempotency keys, with V9 indexes; `PATCH /api/v1/merchants/me`; `WebhookConsumer` pinned by three unit tests.** |

@@ -1595,3 +1595,90 @@ terminal cannot leak from one.
 - Outbox rows and idempotency keys are never deleted. Two slow leaks.
 - `@Scheduled` still runs on every instance.
 - Neon caps at 0.5 GB and 100 compute-hours a month. Neither is close; neither warns.
+
+
+## Day 24 — event ids, retention, and an endpoint for the webhook URL (8 Sep 2026)
+
+**Built**
+- Docs corrected first. The test count was wrong in five places across `README.md`,
+  `architecture.md` and `CONTEXT.md` — and both halves of "27 integration tests plus 2 unit tests"
+  were wrong too, one counting methods and the other counting classes.
+- `eventId` in the webhook payload, carrying the outbox row's own primary key.
+  `OutboxEvent`'s three-argument constructor deleted so the two cannot diverge.
+- `RetentionSweeper` — hourly, deleting published outbox rows older than seven days and idempotency
+  keys older than twenty-four hours, through `@Modifying @Query` rather than derived deletes. V9
+  adds the two indexes it needs.
+- `PATCH /api/v1/merchants/me`, with format validation on the URL, a `SecurityConfig` matcher
+  placed above the ADMIN rule, and the SSRF exposure documented where the write happens.
+- 32 → 33 → 36 → 41 tests, green at every step. Commits `d744f60`, `831f0e8`, `da42bfd`, `0c7207a`.
+
+**Why**
+
+Three gaps left open at the end of Day 23, and they turned out to be three different kinds of
+change: one that needed no schema change, one that needed two indexes, and one that needed neither
+because V8 had already added the column.
+
+The event id is what makes at-least-once delivery usable by a merchant rather than merely correct
+for us. Retention restores an expiry that was lost in a store migration months ago. The endpoint
+replaces a `psql` UPDATE that no merchant could run.
+
+**Concepts**
+- *An id that changes on retry deduplicates nothing.* Delivery is at-least-once by construction, so
+  the event id has to be written once — inside the payment transaction — and survive every
+  republish. That id already existed as `outbox_events.id`. Minting a fresh UUID at publish time
+  would look identical in the code and be worthless in production.
+- *Deleting a constructor is a design decision.* Keeping the three-argument one alongside a
+  two-argument one would let a caller pass a payload built from a different id, with every column
+  still populated. Same reasoning as the deleted `generateToken` overload on Day 8: two entry
+  points making different guarantees get used for the weaker one.
+- *A migration between stores does not move the store's implicit guarantees.* Redis expired
+  idempotency keys for free. Postgres has no TTL, so Day 17 kept the correctness and silently lost
+  the expiry, and the table grew for weeks with no test noticing.
+- *Configure what varies by environment; hardcode what is a product promise.* Rate limits and topic
+  names are config. How long an idempotency key is honoured is a promise to merchants, and a
+  promise that changes per environment is not a promise.
+- *A derived `deleteByX` is a SELECT plus one DELETE per row.* Exactly wrong on a table being
+  cleaned because it got big. `@Modifying @Query` sends one statement — at the cost of not flushing
+  the persistence context, which is why the fixtures use `saveAndFlush()`.
+- *A partial index pays off when its predicate selects a minority.* V7's index on unpublished rows
+  stays the size of the backlog. The mirror image, on published rows, would cover nearly the whole
+  table and save nothing, so V9 is a plain index.
+- *Format validation is not a security control.* `^https?://` rejects `ftp://` and accepts
+  `http://169.254.169.254/latest/meta-data/`. Resolving the host at write time does not fix it
+  either, because of DNS rebinding. The check belongs at delivery time, against the address
+  actually connected to.
+- *`/me` removes the parameter rather than checking it.* There is no id in the route, so "edit
+  another merchant" is not a request that can be expressed — the same move as deleting `merchantId`
+  from `CreatePaymentRequest` on Day 9.
+
+**Interview line**
+
+"Webhook delivery is at-least-once, so merchants need to deduplicate. The subtlety is which id you
+send: I used the outbox row's primary key, written in the same transaction as the payment, because
+an id generated at publish time changes on every retry and deduplicates nothing while looking like
+it does. To make the two incapable of diverging I deleted the constructor that took a ready-made
+payload, so the payload can only be built from the row's own id. Separately, I added an endpoint
+for merchants to set their webhook URL — and documented it as an SSRF exposure, because a
+well-formed URL can still point at the cloud metadata endpoint, and validating the string at write
+time can't fix that when DNS rebinding means the destination changes after you've checked it."
+
+**Mistake & fix**
+
+Two, and the second is the one worth keeping.
+
+The first was mine to catch and I nearly didn't: I listed eleven doc edits and the real number was
+twelve. The one I missed was inside the Mermaid deployment diagram, where the count is spelled out
+as "twenty-nine" rather than written as `29`, so a grep for the digits walked straight past it — in
+the first thing anyone sees when they open the architecture doc. A check that only looks for the
+shape you expect will not find the one you did not.
+
+The second: forty-one green tests, everything pushed, and the endpoint returned an empty 403
+against the local container. `docker compose up -d` starts the existing image and does not rebuild
+on source changes, so the container was running code from before the endpoint existed. The
+diagnosis was in the responses rather than the logs — the `ftp://` request returned 403 instead of
+400, and validation returning nothing means the request never reached the controller.
+
+That is the third time on this project that passing tests disagreed with a running system and the
+answer was a stale artifact, after Render building `c8fa4df` and then `de87094` on Day 14. Two days
+went into those. The rule now: `./mvnw test`, a running container and a deployed service are three
+builds of three different snapshots, so when they disagree, suspect the artifact before the logic.

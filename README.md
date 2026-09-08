@@ -32,7 +32,7 @@ curl -s https://transakt.onrender.com/api/v1/health
 | **Reconciliation** | A bank call that times out leaves a payment `PENDING`, not `FAILED` — you don't know whether the bank acted. A scheduled sweep asks and settles. |
 | **Transactional outbox** | The `payment.settled` event row commits with the payment. Either both exist or neither does, so an event cannot be lost. |
 | **Kafka + webhooks** | A publisher sweeps unpublished events to Kafka; a consumer delivers them to the merchant with retries and a dead-letter topic. |
-| **32 tests** | 25 integration tests through the full filter chain against a real database, plus 7 unit tests where the behaviour needs a dependency to fail on demand. |
+| **41 tests** | 34 integration tests through the full filter chain against a real database, plus 7 unit tests where the behaviour needs a dependency to fail on demand. |
 
 ---
 
@@ -125,6 +125,7 @@ forever or dropped.
 | `GET` | `/api/v1/health` | open |
 | `POST` | `/api/v1/auth/login` | open |
 | `POST` | `/api/v1/merchants` | open — signup; response carries the API key **once** |
+| `PATCH` | `/api/v1/merchants/me` | authenticated; sets the caller's own `webhook_url`. No id in the route |
 | `GET` `PUT` `DELETE` | `/api/v1/merchants/**` | `ROLE_ADMIN` |
 | `POST` | `/api/v1/payments` | authenticated; merchant taken from the credential; optional `Idempotency-Key` |
 | `GET` | `/api/v1/payments` | authenticated; scoped to the caller; paginated, max 100 per page |
@@ -156,7 +157,7 @@ database at startup, so there is no setup SQL to run and nothing to configure.
 ./mvnw test
 ```
 
-Thirty-two tests, about twenty-five seconds. Needs Postgres and Redis reachable on localhost —
+Forty-one tests, about twenty-five seconds. Needs Postgres and Redis reachable on localhost —
 `docker compose up` provides both. The Kafka listener is disabled in the test profile, so no
 broker is required.
 
@@ -211,6 +212,12 @@ Each of these was a choice with a trade-off rather than a default, and each is w
 - **The webhook client has explicit timeouts.** An endpoint that hangs rather than failing would
   never throw, so no retry would fire, nothing would reach the dead letter, and every merchant
   behind that record on the partition would wait with it.
+- **The event id is the outbox row's primary key, not a new UUID.** Delivery is at-least-once, so
+  an id minted at publish time would differ on every retry and deduplicate nothing while looking
+  like it did. The row id is written inside the payment transaction and survives every republish.
+- **`/me` has no path variable.** Editing another merchant isn't a request that can be expressed,
+  so there is no ownership check to get wrong — the same move as deleting `merchantId` from the
+  payment DTO.
 - **`sslmode` is a variable, defaulting to `prefer`.** The driver tries TLS and falls back, so one
   image runs against a local Postgres that doesn't offer it and a managed one that demands it.
 - **Tests are integration tests deliberately.** A mocked unit test of the service layer passes
@@ -228,11 +235,16 @@ Stated rather than discovered:
   network blocks Aiven at DNS, so the deployed instance accumulates unpublished outbox rows.
 - **`@Scheduled` runs on every instance.** Two copies of the app would sweep the same rows
   simultaneously. `SELECT ... FOR UPDATE SKIP LOCKED` or ShedLock is the fix.
-- **Webhook delivery is at-least-once with no event id**, so merchants have nothing to
-  deduplicate on. Stripe includes one for exactly this reason.
+- **A merchant can point their webhook at any address this server can reach.** The URL is format
+  validated, which rejects `ftp://` and accepts `http://169.254.169.254/`. That is SSRF. Resolving
+  the host at write time wouldn't fix it either, because DNS rebinding lets the destination change
+  after the check — it belongs in `WebhookConsumer`, against the address actually connected to.
+  Unreachable in production today only because no broker is deployed, which makes it a blocker on
+  deploying Kafka rather than an open incident.
 - **The dead-letter path is untested.** Verified by hand, not by CI.
-- **Outbox rows and idempotency keys are never deleted.** Two slow leaks, both fixable with a
-  scheduled cleanup.
+- **An idempotency key stops being honoured after 24 hours.** `RetentionSweeper` deletes it, so
+  the same key then starts a new payment. Intended, and the window Stripe publishes — but it is a
+  behaviour, not just housekeeping.
 - **A stranded payment isn't recoverable by retry.** The reconciler resolves it, but the
   idempotency key means a retry returns the stranded payment rather than starting fresh.
 - **The database is no longer on the app's private network.** Postgres moved to Neon, so every
@@ -255,7 +267,8 @@ Stated rather than discovered:
 - **The API key prefix carries ~20 bits of entropy.** Collisions become plausible near a thousand
   merchants.
 - **JWTs cannot be revoked before they expire.** The one-hour lifetime is the mitigation.
-- **There is no endpoint to set `webhook_url`.** It is set directly in the database today.
+- **A merchant can write `webhook_url` but not read it back.** `PATCH /api/v1/merchants/me`
+  exists; there is no matching `GET`, so confirming the stored value needs an admin.
 - **Dependency CVEs are unaudited.** Spring Boot 3.4.1 pulls transitive versions with known
   advisories.
 
@@ -277,10 +290,9 @@ Stated rather than discovered:
 
 **Next, in order of how much they matter:**
 
+- **Refuse private and link-local addresses in `WebhookConsumer` — before any broker is deployed**
 - A test for the dead-letter path
-- An event id in the webhook payload, so merchants can deduplicate an at-least-once delivery
-- Scheduled cleanup for published outbox rows and expired idempotency keys
-- `PATCH /api/v1/merchants/me` to set `webhook_url` through the API rather than through psql
+- `GET /api/v1/merchants/me`, so a merchant can read back the webhook URL they just set
 
 **Later, if the project continues:** refunds as a second event type on the same outbox ·
 `SELECT ... FOR UPDATE SKIP LOCKED` so the schedulers survive more than one instance ·

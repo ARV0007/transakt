@@ -1967,3 +1967,214 @@ day you need to move.
 The decisions that bought it here — version the schema, parameterise every address, default
 permissive and override strict — each looked like ordinary hygiene at the time. None of them was
 motivated by "we might change providers." That is usually how this works.
+
+
+## Why the event id has to be the row's primary key
+
+### The restaurant version
+
+A runner takes a plate out and comes back unsure whether he actually set it down. Sending a second
+plate is cheap insurance — but only if the ticket stapled to it carries the same number as the
+first. Two plates with two different numbers is not a duplicate, it is a second order, and the
+diner gets charged twice. The number has to be written on the ticket in the kitchen, once, before
+the plate leaves. A number the runner invents on his way out is a different number every trip.
+
+### The technical version
+
+Delivery is at-least-once by construction. `OutboxPublisher` sends to Kafka and then stamps
+`published_at`; if the process dies in the gap, the next sweep finds the row unstamped and sends it
+again. Kafka redelivers on consumer failure too. So a merchant will, eventually, see the same event
+twice.
+
+That is the correct trade — the alternative is stamping before the send, which loses events instead
+of duplicating them. But it hands the merchant a question: is this the same event I already
+processed, or a second payment for the same amount?
+
+An id answers it, and only if it is identical on both copies. Which rules out the obvious
+implementation:
+
+```java
+String payload = "{\"eventId\":\"" + UUID.randomUUID() + "\", ... }";   // wrong
+```
+
+Generate the id at publish time and every retry gets a fresh one. The merchant sees two events with
+two ids and no way to relate them. That is worse than no id at all, because they will trust it.
+
+The id has to be written once, when the event is created, inside the payment transaction, and never
+change again. Which means it already exists: it is `outbox_events.id`. The payload is stored once
+and resent verbatim, so every redelivery carries the same id for free — and no new column is
+needed. If you find yourself writing a migration for this, you have picked the wrong id.
+
+### Making the two incapable of disagreeing
+
+The trap here is the one the API key hit on Day 12c: generate a credential once into a variable, or
+the stored prefix and the stored hash end up belonging to two different keys. The row id and the
+payload id can diverge exactly the same way, and every column would still look correctly populated.
+
+So `OutboxEvent`'s three-argument constructor was deleted rather than kept alongside a new one. The
+payload is now set after construction, formatted from `event.getId()`. There is no second UUID to
+keep in sync because there is nowhere to put one. Two constructors making different guarantees will
+eventually be used for the weaker one — the same reasoning that deleted the two-argument
+`generateToken` overload on Day 8.
+
+---
+
+## What Redis was doing for free
+
+Idempotency keys used to live in Redis under `SET NX EX`, with a 24-hour TTL. On Day 17 they moved
+into Postgres, under a unique constraint, written inside the payment transaction. That move was
+right: it made idempotency survive a Redis outage and put it in the same transaction as the thing
+it protects.
+
+It also silently dropped the expiry. Postgres has no TTL. Nothing failed, no test went red, and the
+table just kept growing — with keys from three weeks ago still being honoured.
+
+That is the shape worth remembering. **A migration between stores moves the data, but not the
+guarantees the old store was providing implicitly.** TTL, eviction, ordering, the atomicity of a
+multi-key operation — these are properties of the store, not of the data, and they do not travel.
+The guarantees you wrote down get re-implemented. The ones the store did for you get lost, and you
+notice months later, or not at all.
+
+So `RetentionSweeper` is not new policy. It restores a guarantee that existed and then stopped.
+
+### The two windows are not the same kind of thing
+
+- **Idempotency keys, 24 hours.** A promise to merchants: reuse a key inside the window and you get
+  the original payment back. After it, the same key starts a new payment. That is intended, and it
+  is the window Stripe publishes.
+- **Published outbox rows, 7 days.** Not a promise — a debugging window, "did we actually send that
+  event, and when". The outbox is a queue, not an archive; once `published_at` is stamped the row
+  has done its job.
+
+Both are constants in code, not configuration, and the distinction generalises. Rate limits and
+topic names are configuration because they legitimately differ between environments. How long an
+idempotency key is honoured is a product decision, and a promise that changes per environment is
+not a promise.
+
+### The clause the whole thing rests on
+
+```sql
+WHERE published_at IS NOT NULL AND published_at < :cutoff
+```
+
+An old **unpublished** row is not junk. It is precisely a row that has been failing to publish: a
+merchant who was never told their payment settled. It is also the oldest row in the table, so the
+tempting `WHERE created_at < :cutoff` would eat exactly the events that still matter, oldest first.
+The outbox pattern exists to make that loss impossible and one careless DELETE would undo it.
+
+It gets its own test for that reason — a year-old unpublished row has to survive the sweep.
+
+---
+
+## A derived delete is a loop
+
+```java
+int deleteByPublishedAtBefore(Instant cutoff);        // looks like one statement
+```
+
+It is not. Spring Data implements a derived delete by SELECTing every matching row into the
+persistence context and issuing one DELETE per row, so that entity lifecycle callbacks fire. On a
+table you are cleaning *because it got big*, that is the worst possible shape: the memory spike is
+proportional to the mess you are trying to clear.
+
+```java
+@Modifying
+@Query("DELETE FROM OutboxEvent e WHERE e.publishedAt IS NOT NULL AND e.publishedAt < :cutoff")
+int deletePublishedBefore(@Param("cutoff") Instant cutoff);
+```
+
+One statement, nothing materialised. The cost is that it bypasses the persistence context — which
+also means it does **not** flush pending changes before running. A test that saved rows with
+`save()` and then swept would run the DELETE against a table that does not yet contain them, and
+pass for entirely the wrong reason. `saveAndFlush()` in the fixtures is what makes the ordering
+real rather than lucky.
+
+### When a partial index is worth it
+
+V7 indexes the outbox partially:
+
+```sql
+CREATE INDEX idx_outbox_events_unpublished ON outbox_events (created_at) WHERE published_at IS NULL;
+```
+
+The sweeper wants the mirror image of that predicate, and the instinct is to write the mirror-image
+partial index. That would be pointless. **A partial index pays off when its predicate selects a
+minority of rows.** Unpublished events are a transient backlog, so V7's index stays the size of the
+backlog however large the table grows. Published events are nearly the whole table, so a partial
+index on them would be no smaller than a plain one and would carry an extra condition the planner
+has to match against the query. Plain index, V9.
+
+Being honest about scale: at this project's row counts Postgres will sequential-scan either way.
+These exist so the sweep stays cheap as the tables grow, not because anything is slow today.
+
+---
+
+## Validating a string is not validating a destination
+
+`PATCH /api/v1/merchants/me` lets a merchant set the URL their webhooks are delivered to. The DTO
+validates the format:
+
+```java
+@Pattern(regexp = "^https?://\\S+$")
+```
+
+That rejects `ftp://elsewhere.example.com/hook` with a 400. It also accepts
+`http://169.254.169.254/latest/meta-data/` with a 200 — a perfectly well-formed URL, and the cloud
+instance-metadata endpoint. So is `http://localhost:5432`. So is any address on the private
+network.
+
+This is server-side request forgery. What makes a webhook URL different from any other string field
+is that **this server** makes the outbound request, with this server's network identity, to a
+destination the merchant chose. Signup is `permitAll`, so anyone on the internet can register and
+choose one. Even with the response body discarded, the status code and the timing are enough to map
+an internal network.
+
+### Why the fix cannot live in validation
+
+The obvious answer is to resolve the hostname at write time and refuse loopback, link-local and
+site-local addresses. It does not work, and the reason has a name worth knowing: **DNS rebinding**.
+A hostname that resolves to a public address when the URL is saved can resolve to `127.0.0.1` when
+the URL is called, because whoever registered it controls the record and its TTL. Nothing about the
+string changed. The destination did.
+
+So the check belongs at **delivery** time, in `WebhookConsumer`, against the address actually being
+connected to. Format validation at write time is still worth having — it catches typos and
+unsupported schemes cheaply — but it is a usability feature, not a security control, and the code
+should say so rather than implying otherwise by existing.
+
+### Why it is not closed yet, and when it must be
+
+No broker is deployed on Render, so `WebhookConsumer` never runs and nothing outbound is ever sent.
+The hole is real in the code and unreachable in production. That makes it a blocker on deploying
+Kafka rather than an incident today — which is the only thing that made it acceptable to ship the
+endpoint first and write this section second.
+
+---
+
+## When the tests pass and the thing in front of you disagrees
+
+Forty-one green tests, three commits pushed, and `PATCH /api/v1/merchants/me` returned an empty 403
+against the local container. The instinct is to doubt the code. The code was fine.
+`docker compose up -d` starts the **existing image**; it does not rebuild when source changes. The
+container had come up in 0.4 seconds from an image built before the endpoint existed.
+
+The tell was in the responses, not the logs. The `ftp://` request also returned 403 rather than
+400. If the new code were running, validation would have rejected that scheme with a JSON body
+naming the field. A 403 means the request never reached the controller at all — and only one thing
+stops a request that early.
+
+### Third occurrence of the same pattern
+
+- **Day 14.** Render kept building `c8fa4df`, because the config edits were never pushed.
+- **Day 14 again.** `de87094` was pushed, but its diff was one modified line rather than the three
+  insertions expected — the edits believed to be in it were not in it.
+- **Day 24.** Compose ran a stale image.
+
+Every time, the code was right and the **running artifact was old**. Two days went into the first
+two.
+
+The generalisation: `./mvnw test`, a running container, and a deployed service are three different
+builds of three different snapshots, and nothing keeps them in step for you. When the tests pass
+and the live thing disagrees, suspect the artifact before the logic — `git log origin/main -1` for
+what a platform will build, `docker compose up -d --build` for compose. And read the *shape* of the
+wrong answer, not just its status: a 403 where a 400 was expected says which layer answered.
