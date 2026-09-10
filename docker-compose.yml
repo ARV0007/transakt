@@ -65,6 +65,8 @@ services:
       REDIS_HOST: redis
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       JWT_SECRET: transakt-dev-secret-key-change-me-min-32-chars
+      # Local only. Lets webhooks reach localhost and container hostnames.
+      WEBHOOK_ALLOW_PRIVATE_TARGETS: "true"
     depends_on:
       postgres:
         condition: service_healthy

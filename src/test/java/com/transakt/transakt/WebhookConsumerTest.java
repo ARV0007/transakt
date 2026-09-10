@@ -9,6 +9,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.client.MockRestServiceServer;
+import com.transakt.transakt.webhook.WebhookTargetValidator;
 import org.springframework.web.client.RestClient;
 
 import java.util.Optional;
@@ -49,7 +50,36 @@ class WebhookConsumerTest {
         RestClient.Builder builder = RestClient.builder();
         mockServer = MockRestServiceServer.bindTo(builder).build();
 
-        consumer = new WebhookConsumer(merchantRepository, new ObjectMapper(), builder.build());
+        // Permissive on purpose: these tests point at merchant.example.com, which
+        // does not resolve. The guard itself is pinned by WebhookTargetValidatorTest.
+        consumer = new WebhookConsumer(merchantRepository, new ObjectMapper(),
+                builder.build(), new WebhookTargetValidator(true));
+    }
+
+    /**
+     * The SSRF guard, from the consumer's side.
+     *
+     * A merchant CAN still store this URL - PATCH /api/v1/merchants/me only
+     * format-validates - so the last line of defence is here, and this test proves
+     * the request is never made. It must not throw: a blocked address will never
+     * become deliverable, so retrying and dead-lettering would waste the budget.
+     */
+    @Test
+    void makesNoCallWhenTheTargetResolvesToAPrivateAddress() throws Exception {
+        MerchantRepository repository = mock(MerchantRepository.class);
+        Merchant merchant = new Merchant();
+        merchant.setWebhookUrl("http://169.254.169.254/latest/meta-data/");
+        when(repository.findById(anyString())).thenReturn(Optional.of(merchant));
+
+        RestClient.Builder builder = RestClient.builder();
+        MockRestServiceServer server = MockRestServiceServer.bindTo(builder).build();
+
+        WebhookConsumer guarded = new WebhookConsumer(repository, new ObjectMapper(),
+                builder.build(), new WebhookTargetValidator(false));
+
+        guarded.deliver(PAYLOAD);
+
+        server.verify();
     }
 
     @Test

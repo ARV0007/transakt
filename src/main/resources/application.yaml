@@ -44,3 +44,9 @@ ratelimit:
 
 outbox:
   topic: ${OUTBOX_TOPIC:payment.settled}
+
+webhook:
+  # SSRF guard. False means the consumer refuses to deliver to loopback, link-local,
+  # private or unresolvable addresses. The default is false so a deploy that forgets
+  # this variable fails SAFE. Local development sets it true in docker-compose.
+  allow-private-targets: ${WEBHOOK_ALLOW_PRIVATE_TARGETS:false}

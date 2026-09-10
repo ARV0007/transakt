@@ -19,6 +19,11 @@ import java.util.Optional;
  * succeeds. A merchant whose server is down blocks nothing — the retries happen
  * on the consumer's thread, never on the payment request thread.
  *
+ * A target the WebhookTargetValidator refuses is skipped rather than thrown on. A
+ * blocked address is a permanent condition, not a transient failure: retrying three
+ * times and dead-lettering would spend the whole retry budget on something that can
+ * never succeed. Skipping matches how a merchant with no webhook URL is handled.
+ *
  * The RestClient is injected rather than created here, and the bean that supplies
  * it sets connect and read timeouts. Without them, a merchant endpoint that accepts
  * the connection and then never answers would block this thread indefinitely: no
@@ -33,13 +38,16 @@ public class WebhookConsumer {
     private final MerchantRepository merchantRepository;
     private final ObjectMapper objectMapper;
     private final RestClient restClient;
+    private final WebhookTargetValidator targetValidator;
 
     public WebhookConsumer(MerchantRepository merchantRepository,
                            ObjectMapper objectMapper,
-                           RestClient webhookRestClient) {
+                           RestClient webhookRestClient,
+                           WebhookTargetValidator targetValidator) {
         this.merchantRepository = merchantRepository;
         this.objectMapper = objectMapper;
         this.restClient = webhookRestClient;
+        this.targetValidator = targetValidator;
     }
 
     @KafkaListener(topics = "${outbox.topic}", groupId = "transakt-webhooks")
@@ -54,6 +62,16 @@ public class WebhookConsumer {
         }
 
         String url = merchant.get().getWebhookUrl();
+
+        // Checked HERE, immediately before connecting, and never at write time -
+        // see WebhookTargetValidator for why DNS rebinding makes a save-time check
+        // meaningless.
+        if (!targetValidator.isAllowed(url)) {
+            log.warn("Refusing to deliver to {} for merchant {} - the target resolves to a "
+                    + "private, loopback or link-local address", url, merchantId);
+            return;
+        }
+
         restClient.post()
                 .uri(url)
                 .header("Content-Type", "application/json")
