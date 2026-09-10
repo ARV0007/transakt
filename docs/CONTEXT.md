@@ -735,6 +735,7 @@ settlement, reconciler, outbox, Kafka publisher, webhook consumer with retries a
 - `docs/WORKLOG.md` — daily entries: Built / Why / Concepts / Interview line / Mistake & fix
 - `docs/architecture.md` — versioned architecture with Mermaid diagrams, currently **v1.7**:
   a deployment topology diagram plus the application internals
-- `docs/UNDERSTANDING.md` — from-scratch primer: what a gateway is, HTTP and Postman from
-  zero, credentials explained, day-by-day reasoning, interview narrative, deployment roadmap
+- `docs/UNDERSTANDING.md` — the from-scratch teaching document, 32 chapters in build order.
+  Every step as: the situation, what we did, why, and the counter-questions someone would ask
+  at that moment. Chapter 32 says how it is kept up to date. Update it with the others.
 - `docs/CONTEXT.md` — this file
