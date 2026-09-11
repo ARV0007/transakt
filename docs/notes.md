@@ -2178,3 +2178,187 @@ builds of three different snapshots, and nothing keeps them in step for you. Whe
 and the live thing disagrees, suspect the artifact before the logic — `git log origin/main -1` for
 what a platform will build, `docker compose up -d --build` for compose. And read the *shape* of the
 wrong answer, not just its status: a 403 where a 400 was expected says which layer answered.
+
+
+## The field initialiser that wasn't
+
+Signup accepted this for twenty-two days:
+
+```json
+POST /api/v1/merchants
+{"name":"x","email":"e@x.com","password":"hunter2","role":"ADMIN"}
+```
+
+and returned an administrator. `/api/v1/merchants/**` is `hasRole("ADMIN")`, so that
+account could then read, edit and delete every merchant on the platform. Signup is
+`permitAll`, so the attacker needed nothing at all — not a key, not a login, not a
+referral.
+
+### Why it worked
+
+Three things lined up, and any two of them would have been harmless.
+
+**One.** `MerchantController.create` took `@RequestBody Merchant` — the entity, which
+has a `role` column. Every other write path in the project had a DTO by Day 6.
+Signup was written on Day 3, before DTOs existed, and nothing ever went back for it.
+
+**Two.** `Merchant.role` has a field initialiser:
+
+```java
+@Enumerated(EnumType.STRING)
+@Column(nullable = false)
+private MerchantRole role = MerchantRole.MERCHANT;
+```
+
+That looks like a safe default and is not one. **A field initialiser runs at
+construction. Jackson's setter runs after it.** So by the time the object reached the
+service, the "default" had already been overwritten by whatever was in the body.
+
+**Three.** `MerchantService.create` set the id, the API key, the prefix, the hash, the
+timestamp and hashed the password — and never touched `role`. It had no reason to:
+the field looked like it defaulted correctly.
+
+### The general shape
+
+**A default that is applied before untrusted input is not a default, it is a
+suggestion.** This is mass assignment, and it is the same bug that has bitten Rails
+(`attr_accessible`), Spring MVC (`@InitBinder` allow-lists) and every framework that
+binds request bodies onto persistent objects. The framework is doing exactly what it
+was told; the mistake is telling it to bind a body onto a class that has fields the
+caller must not control.
+
+### Why the fix is a DTO and not a guard
+
+The tempting fix is one line in the service:
+
+```java
+merchant.setRole(MerchantRole.MERCHANT);   // don't
+```
+
+That works today and rots immediately. It has to be repeated on every path that
+constructs a merchant, forever, and the one that gets forgotten is a vulnerability.
+It also leaves `role` visible in the request contract, so a client can reasonably
+believe it means something.
+
+`CreateMerchantRequest` has no `role` field. A forged one has nowhere to bind and
+evaporates during deserialisation. The attack is not rejected — **it cannot be
+expressed.** Same reasoning that removed `merchantId` from `CreatePaymentRequest` on
+Day 9 and gave `PATCH /merchants/me` no path variable on Day 24. Three instances of
+one idea, and this is the one that was missed.
+
+### The test worth copying
+
+Two tests, and they check different things:
+
+```java
+void aRoleInTheSignupBodyIsIgnored()                     // the response SAYS MERCHANT
+void aMerchantWhoAskedForAdminStillCannotUseAdminRoutes() // the credential CANNOT act
+```
+
+The first would keep passing if someone changed the serialisation while leaving the
+authority intact. The second is the one an attacker cares about: sign up asking for
+ADMIN, log in, hit `GET /api/v1/merchants`, expect 403. **Assert on what a credential
+can do, not on what a response says about it.**
+
+---
+
+## Where an SSRF check has to live
+
+Day 24 shipped `PATCH /api/v1/merchants/me` with the SSRF exposure documented rather
+than fixed. Day 25 closed it, and *where* the fix went is the whole lesson.
+
+### What does not work
+
+**Format validation.** `^https?://\S+$` rejects `ftp://` and accepts
+`http://169.254.169.254/latest/meta-data/`. That was demonstrated live: two curls,
+one 400 and one 200, same endpoint.
+
+**Resolving the hostname when the URL is saved.** This is the fix most people reach
+for, and it is defeated by **DNS rebinding**. Whoever registered the hostname
+controls its record and its TTL, so a name that resolves to a public address when
+you check it can resolve to `127.0.0.1` when you call it. Nothing about the string
+changed. The destination did. A check that can be true at write time and false at
+call time is not a security control, it is a delay.
+
+### What does
+
+Resolve and check **immediately before connecting**, in `WebhookConsumer`:
+
+```java
+if (!targetValidator.isAllowed(url)) {
+    log.warn("Refusing to deliver to {} for merchant {} - ...", url, merchantId);
+    return;
+}
+```
+
+`WebhookTargetValidator` rejects loopback, link-local, site-local, the wildcard
+address, multicast, and IPv6 unique-local. Two details worth knowing:
+
+**`isSiteLocalAddress()` does not cover `fc00::/7`.** Java's method covers the
+*deprecated* `fec0::/10` for IPv6. The range actually used for private IPv6 today
+would pass every built-in check, so it needs an explicit test on the first byte.
+
+**Every address a name resolves to must pass.** A hostname with one public A record
+and one pointing at `127.0.0.1` is an attack, not a typo, so the loop rejects on any
+match rather than accepting on the first good one.
+
+### Fail closed, and fail closed by default
+
+An unresolvable host is **refused**. If you cannot determine where a URL points, you
+do not send anything there.
+
+And the escape hatch that makes local development possible defaults to off:
+
+```yaml
+allow-private-targets: ${WEBHOOK_ALLOW_PRIVATE_TARGETS:false}
+```
+
+A deploy that forgets the variable **blocks** private targets. The opposite default
+would mean one missed environment variable silently reopens the hole, and nothing
+would fail, and nobody would notice. **Choose the default that is safe when someone
+forgets, because someone will forget.**
+
+Contrast this with the rate limiter, which fails *open* on a Redis outage. Both are
+right. The question is never "fail open or closed" in the abstract — it is "which
+failure is worse here". A rate limiter that fails closed causes the outage it exists
+to prevent. An SSRF guard that fails open hands an attacker your internal network.
+
+### How far it actually goes
+
+Honest limit: this is TOCTOU. Java resolves the host for the check, then `RestClient`
+resolves again to connect, and in principle the record could change between them.
+Closing that properly means pinning the resolved IP and connecting to *it* with an
+explicit `Host` header. Worth saying out loud if asked how complete the fix is.
+
+---
+
+## Retry-After, and why a wrong one is worse than none
+
+A 429 tells a client to stop. It does not tell it when it may resume, and without
+that a well-behaved client either gives up on a request that would have succeeded or
+guesses — usually by retrying immediately, which deepens the overload.
+
+```java
+response.setStatus(429);
+response.setHeader("Retry-After", String.valueOf(retryAfter));
+```
+
+Three decisions in that line.
+
+**Seconds, not an HTTP date.** RFC 9110 allows both. A seconds count is immune to
+clock skew between server and client; a date is not.
+
+**Rounded up, never zero.** The window is a fixed minute, so the remaining time is
+`60000 - (millis % 60000)`, and that is rounded *up* to whole seconds. Telling a
+client to wait 0 seconds when 400ms remain sends it straight back into the same
+window and straight back into a 429. **A Retry-After that is too short is worse than
+no header at all**, because a client that trusts it retries in a tight loop.
+
+**The calculation lives in `RateLimitService`, not the filter.** The window boundary
+is the service's concept. If the algorithm ever becomes a sliding window or a token
+bucket, the filter should only have to ask "how long", not know how the answer is
+worked out.
+
+And the reason it is written by hand rather than thrown: **filters run before the
+DispatcherServlet**, so `@RestControllerAdvice` cannot catch anything from here. That
+constraint has now shaped three separate pieces of this codebase.

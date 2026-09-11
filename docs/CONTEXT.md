@@ -67,7 +67,7 @@ That is deliberate — a container that starts in two seconds and can be thrown 
 shared remote database, and the parameterised config means the same image works against either.
 
 **To run everything locally:** `docker compose up` — Postgres, Redis, Kafka and the app.
-**To run the tests:** all three stores up, then `./mvnw test`. Expect 41 tests, ~25 seconds.
+**To run the tests:** all three stores up, then `./mvnw test`. Expect 61 tests, well under a minute.
 **Before running the app bare:** `lsof -ti :8080 | xargs kill` — a leftover instance is the usual
 cause of "port already in use", and a failed startup means Flyway never ran.
 
@@ -155,7 +155,7 @@ until Day 23, which nested it under `ratelimit:` and made it invisible.
 
 ---
 
-## Current state: Day 24 complete — feature work done, infrastructure settled
+## Current state: Day 25 complete — feature work done, two security fixes landed
 
 | Day | What was built |
 |-----|----------------|
@@ -185,8 +185,9 @@ until Day 23, which nested it under `ratelimit:` and made it invisible.
 | 22 | **End-to-end verification** of the retry and dead-letter path; docs to v1.6 |
 | 23 | **Kafka listener disarmed in tests** so CI no longer needs a broker; **misplaced `bank:` block** in the test profile found and fixed (suite twice as fast, decisions deterministic); **Postgres moved to Neon**, `sslmode` parameterised |
 | 24 | **Docs corrected** — the test count was wrong in five places, and both halves of "27 integration plus 2 unit" were wrong too; **`eventId` in the webhook payload** carrying the outbox row's primary key, three-argument `OutboxEvent` constructor deleted so the two cannot diverge; **`RetentionSweeper`** — hourly, seven-day outbox and 24-hour idempotency windows, `@Modifying @Query` deletes, V9 indexes; **`PATCH /api/v1/merchants/me`** with format validation, a security matcher above the ADMIN rule, and the SSRF exposure documented |
+| 25 | **SSRF guard** — `WebhookTargetValidator` resolves the host immediately before the POST and refuses loopback, link-local, site-local and unresolvable targets; `WEBHOOK_ALLOW_PRIVATE_TARGETS` defaults to false so a forgotten variable fails safe; **`GET /api/v1/merchants/me`**, with the `/me` security matcher no longer scoped to one HTTP method; **signup privilege escalation fixed** — `POST /api/v1/merchants` bound the body onto the `Merchant` entity, so an unauthenticated `{"role":"ADMIN"}` produced an administrator. `CreateMerchantRequest` has no role field, and `@NotBlank` on password closes the account that could never log in; **`Retry-After` on 429s**, rounded up so it is never zero |
 
-Architecture doc is at **v1.8**.
+Architecture doc is at **v1.9**.
 
 **Verified working in production (7 Sep, on Neon):**
 `GET /health` returns `{"status":"UP","service":"transakt"}` ·
@@ -280,6 +281,7 @@ com.transakt.transakt
 │               IdempotencyKeyRepository, RetentionSweeper (hourly, @Modifying deletes)
 │               IdempotencyConflictException was DELETED in v1.4 — unreachable
 ├── merchant/   Merchant (entity, has webhookUrl since V8), UpdateWebhookRequest (DTO),
+│               CreateMerchantRequest (DTO — signup binds HERE, never to the entity),
 │               MerchantRole (enum),
 │               MerchantRepository, MerchantService, MerchantController
 ├── payment/    Payment, PaymentStatus (PENDING / CAPTURED / FAILED),
@@ -314,7 +316,7 @@ src/test/java/com/transakt/transakt
 ├── AuthIntegrationTest                                                     (6)
 ├── OwnershipIntegrationTest                                                (5)
 ├── IdempotencyIntegrationTest                                              (5)
-├── RateLimitIntegrationTest                                                (2)
+├── RateLimitIntegrationTest                                                (3)
 ├── RateLimitServiceTest               unit — mocked StringRedisTemplate    (1)
 ├── ApprovedPaymentIntegrationTest                                          (1)
 ├── DeclinedPaymentIntegrationTest                                          (1)
@@ -322,9 +324,12 @@ src/test/java/com/transakt/transakt
 ├── OutboxIntegrationTest                                                   (3)
 ├── RetentionSweeperIntegrationTest                                         (3)
 ├── MerchantWebhookIntegrationTest                                          (5)
+├── MerchantMeIntegrationTest                                               (4)
+├── MerchantSignupSecurityIntegrationTest                                   (5)
 ├── OutboxPublisherTest                unit — mocked KafkaTemplate          (3)
-└── WebhookConsumerTest                unit — MockRestServiceServer         (3)
-                                                                    total = 41
+├── WebhookConsumerTest                unit — MockRestServiceServer         (4)
+└── WebhookTargetValidatorTest         unit — literal IPs, no DNS           (9)
+                                                                    total = 61
 
 src/test/resources/application-test.yaml    the `test` profile
 ```
@@ -448,6 +453,7 @@ The Neon database, built empty on Day 23, reports eight.
 | GET | `/api/v1/health` | open |
 | POST | `/api/v1/auth/login` | open |
 | POST | `/api/v1/merchants` | open (bootstrap: signup) — response carries the API key **once** |
+| GET | `/api/v1/merchants/me` | authenticated; the **caller's own** record — no id in the route |
 | PATCH | `/api/v1/merchants/me` | authenticated; sets the **caller's own** `webhook_url` — no id in the route |
 | GET/PUT/DELETE | `/api/v1/merchants/**` | requires `ROLE_ADMIN` |
 | POST | `/api/v1/payments` | authenticated; merchant from the token; optional `Idempotency-Key` |
@@ -685,24 +691,21 @@ back.
 **Feature work is done and the infrastructure is settled.** Payment gateway, two auth doors,
 double-entry ledger, ownership, idempotency, rate limiting, bank simulator, two-transaction
 settlement, reconciler, outbox, Kafka publisher, webhook consumer with retries and a DLQ.
-41 tests, CI green in under a minute, database on a tier that doesn't expire.
+61 tests, CI green in under a minute, database on a tier that doesn't expire.
 
 **Nothing is currently broken.** No dates on the calendar.
 
 **In order of value:**
 
-- **BLOCKS DEPLOYING KAFKA — refuse private and link-local addresses in `WebhookConsumer`.** A
-  merchant can set `webhook_url` to `http://169.254.169.254/latest/meta-data/` and the format
-  validation accepts it, along with `http://localhost:5432` and anything on the private network.
-  Signup is open, so anyone can register and set one. Harmless *only* because no broker is
-  deployed and the consumer never runs. The check must be at delivery time on the resolved
-  address: a write-time check can be true when saved and false when called, because whoever owns
-  the hostname controls its DNS record. Close this before Kafka goes anywhere near production.
 - A test for the dead-letter path — `WebhookConsumer` is pinned since Day 24, but the hand-off to
   `payment.settled-dlt` after the retries run out is still proved only by a manual run
-- `GET /api/v1/merchants/me`, so a merchant can read back the webhook URL they just set
 - `SELECT ... FOR UPDATE SKIP LOCKED` or ShedLock, so the three schedulers survive a second
-  instance — publisher, reconciler and now the retention sweeper
+  instance — publisher, reconciler and the retention sweeper. Invisible while one instance runs,
+  so it is currently better explained than built
+- A DTO for `PUT /api/v1/merchants/{id}`, which still takes `@RequestBody Merchant`. ADMIN-only,
+  so not an escalation — but it is the same shape as the signup bug closed on Day 25
+- A test that sends UNDOCUMENTED fields on purpose. The Day 25 escalation survived sixty tests
+  because every one of them sent only fields the API documents, and an attacker does not
 
 **Smaller, still outstanding:**
 

@@ -1682,3 +1682,86 @@ That is the third time on this project that passing tests disagreed with a runni
 answer was a stale artifact, after Render building `c8fa4df` and then `de87094` on Day 14. Two days
 went into those. The rule now: `./mvnw test`, a running container and a deployed service are three
 builds of three different snapshots, so when they disagree, suspect the artifact before the logic.
+
+
+## Day 25 — two security fixes, one of them live (11 Sep 2026)
+
+**Built**
+- `WebhookTargetValidator` — the SSRF hole from Day 24, closed at **delivery** time.
+  Refuses loopback, link-local, site-local, wildcard, multicast and IPv6
+  unique-local. `WEBHOOK_ALLOW_PRIVATE_TARGETS` defaults to **false** so a forgotten
+  variable fails safe; docker-compose sets it true for local work.
+- `GET /api/v1/merchants/me`. The security matcher for `/me` is no longer scoped to
+  a single HTTP method, so a route added there later cannot be forgotten from it.
+- **`CreateMerchantRequest`** — signup was binding the request body onto the
+  `Merchant` entity, so `{"role":"ADMIN"}` in an unauthenticated POST produced an
+  administrator. `@NotBlank` on password closes the no-password account at the same
+  time.
+- `Retry-After` on 429s, computed from the window boundary and rounded up.
+- 41 → 61 tests (44 integration, 17 unit across four classes).
+
+**Why**
+
+Four items off the known-limitations list, and the middle one was not on it — it was
+found by reading the signup path while looking for something else.
+
+The SSRF fix was the one item explicitly blocking a Kafka deployment, so it had to go
+first. The rest are small and visible: a merchant could write a webhook URL but not
+read it back, a 429 said stop without saying when, and signup accepted an account
+that could never log in.
+
+**Concepts**
+- *A default applied before untrusted input is not a default.* `Merchant.role` had a
+  field initialiser of `MERCHANT`. Field initialisers run at **construction**;
+  Jackson's setter runs after. The default was overwritten before the service ever
+  saw the object. This is mass assignment, and the fix is a DTO with no such field —
+  not a guard in the service, which has to be repeated on every path forever.
+- *Assert on what a credential can do, not on what a response says.* One test checks
+  the signup response reads `MERCHANT`; the other logs in and confirms the token is
+  refused by an admin route. The second is the one that matters.
+- *An SSRF check belongs at delivery, not at write.* DNS rebinding means a hostname
+  that resolves publicly when saved can resolve to `127.0.0.1` when called. A check
+  that can be true at write time and false at call time is a delay, not a control.
+- *Fail closed by default when forgetting is the likely failure.* The private-target
+  escape hatch defaults to off, so a missed environment variable blocks rather than
+  allows. The rate limiter fails **open** on the same reasoning applied to a
+  different question: which failure is worse here.
+- *`isSiteLocalAddress()` misses `fc00::/7`.* Java covers the deprecated `fec0::/10`
+  for IPv6, so the range actually used for private IPv6 today needs an explicit check.
+- *A Retry-After that is too short is worse than none.* Rounded up, never zero — a
+  client that trusts a zero retries into the same window in a tight loop.
+- *Scope a security matcher to the path, not the method, when the path cannot be
+  forged.* `/me` can only ever mean the caller, so no method reachable there can
+  elevate anything — and the next route added to `/me` cannot be left out of the list.
+
+**Interview line**
+
+"I found a privilege escalation in my own signup endpoint. It bound the request body
+straight onto the entity, and the entity has a role column — so an unauthenticated
+POST with `role: ADMIN` created an administrator, and the admin routes let you read
+and delete every merchant. What made it subtle is that the field *looked* defaulted:
+`role` had a field initialiser of MERCHANT. But a field initialiser runs at
+construction and Jackson's setter runs after it, so the default was already gone by
+the time my service saw the object. I fixed it with a DTO that has no role field, so
+a forged role has nowhere to bind — the attack can't be expressed rather than being
+rejected. Then I wrote two tests: one that the response says MERCHANT, and one that
+logs in and confirms the token is refused by an admin route, because asserting on
+what a credential can *do* is the one that survives a refactor."
+
+**Mistake & fix**
+
+The escalation existed for twenty-two days, since Day 3, and **no test caught it**.
+Sixty tests, a full integration suite through the real filter chain, CI green on
+every push — and none of them ever sent a field the API did not document. That is
+the honest limitation of a test suite: it checks the requests you thought to write.
+An attacker sends the ones you did not.
+
+Two things would have found it earlier. A rule that no controller binds
+`@RequestBody` to an entity — every other endpoint already followed it, signup was
+simply older than the rule and nobody re-checked. And a test that sends unexpected
+fields on purpose, which is the shape of test I had nowhere in the suite.
+
+Smaller, and mine: I predicted the test counts after each change as 50, 54 and 59,
+and they were 51, 55 and 60. `WebhookTargetValidatorTest` has nine tests, not the
+eight I counted. Harmless here because the real number is printed by the build, but
+the same off-by-one in a doc is exactly what the Day 24 pass spent its morning fixing.
