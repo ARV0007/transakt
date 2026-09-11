@@ -74,19 +74,19 @@ public class RateLimitFilter extends OncePerRequestFilter {
     private void reject(HttpServletResponse response) throws IOException {
         long retryAfter = rateLimitService.secondsUntilReset();
 
-            // Retry-After is what turns a 429 from "you got this wrong" into "wait
-            // this long". 429 and 403 are both refusals but they mean opposite
-            // things: a client that treats 429 like 403 abandons a request that
-            // would have succeeded, and one given no guidance at all retries
-            // immediately and deepens the overload. RFC 9110 allows either a
-            // seconds count or an HTTP date; seconds is simpler and immune to clock
-            // skew between this server and the caller.
-            //
-            // Written by hand because filters run before the DispatcherServlet, so
-            // @RestControllerAdvice cannot reach anything thrown from here.
-            response.setStatus(429);
-            response.setHeader("Retry-After", String.valueOf(retryAfter));
-            response.setContentType("application/json");
+        // Retry-After is what turns a 429 from "you got this wrong" into "wait this
+        // long". 429 and 403 are both refusals but they mean opposite things: a
+        // client that treats 429 like 403 abandons a request that would have
+        // succeeded, and one given no guidance at all retries immediately and
+        // deepens the overload. RFC 9110 allows either a seconds count or an HTTP
+        // date; seconds is simpler and immune to clock skew between this server and
+        // the caller.
+        //
+        // Written by hand because filters run before the DispatcherServlet, so
+        // @RestControllerAdvice cannot reach anything thrown from here.
+        response.setStatus(429);
+        response.setHeader("Retry-After", String.valueOf(retryAfter));
+        response.setContentType("application/json");
         response.getWriter().write(
                 "{\"error\":\"Rate limit exceeded. Try again in " + retryAfter + " seconds.\"}");
     }
