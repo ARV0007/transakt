@@ -16,9 +16,14 @@ public class MerchantController {
         this.merchantService = merchantService;
     }
 
+    /**
+     * Signup. permitAll, because otherwise nobody could create the first account -
+     * which makes this body the largest attack surface in the API, and why it binds
+     * to a DTO rather than to the entity. See CreateMerchantRequest.
+     */
     @PostMapping
-    public Merchant create(@RequestBody Merchant merchant) {
-        return merchantService.create(merchant);
+    public Merchant create(@Valid @RequestBody CreateMerchantRequest request) {
+        return merchantService.create(request);
     }
 
     /**

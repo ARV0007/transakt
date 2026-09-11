@@ -21,7 +21,24 @@ public class MerchantService {
         this.passwordEncoder = passwordEncoder;
     }
 
-    public Merchant create(Merchant merchant) {
+    /**
+     * Takes a DTO, never the entity.
+     *
+     * Binding the request body onto Merchant directly let an unauthenticated caller
+     * POST {"role":"ADMIN"} and become an administrator: Merchant.role's field
+     * initialiser runs at construction, Jackson's setter runs after it, and nothing
+     * in this method reset it. CreateMerchantRequest has no role field, so there is
+     * nowhere for a forged one to land.
+     */
+    public Merchant create(CreateMerchantRequest request) {
+        Merchant merchant = new Merchant();
+        merchant.setName(request.getName());
+        merchant.setEmail(request.getEmail());
+        merchant.setBusinessName(request.getBusinessName());
+
+        // role is deliberately not set. It keeps its field initialiser, MERCHANT,
+        // and there is no longer any input that can change it.
+
         merchant.setId(UUID.randomUUID().toString());
 
         String apiKey = "tk_" + UUID.randomUUID().toString().replace("-", "");
@@ -31,9 +48,9 @@ public class MerchantService {
 
         merchant.setCreatedAt(Instant.now());
 
-        if (merchant.getPassword() != null) {
-            merchant.setPassword(passwordEncoder.encode(merchant.getPassword()));
-        }
+        // No null guard any more: @NotBlank on the DTO makes a merchant who can
+        // never log in impossible to create rather than merely unlikely.
+        merchant.setPassword(passwordEncoder.encode(request.getPassword()));
 
         // The ID is already assigned, so Spring Data's isNew() is false and save()
         // calls merge(), which returns a NEW managed instance carrying only the
