@@ -35,9 +35,15 @@ public class SecurityConfig {
                         .requestMatchers(HttpMethod.POST, "/api/v1/merchants").permitAll()
                         // ABOVE the ADMIN rule, and it has to be. authorizeHttpRequests
                         // is first-match-wins, so putting this line after the next one
-                        // would route every merchant editing its own webhook into the
-                        // ADMIN check and return a silent 403.
-                        .requestMatchers(HttpMethod.PATCH, "/api/v1/merchants/me").authenticated()
+                        // would route every merchant reading or editing its own record
+                        // into the ADMIN check and return a silent 403.
+                        //
+                        // Deliberately NOT scoped to one HTTP method. "/me" can only ever
+                        // mean the caller - there is no id in the path to forge - so no
+                        // method reachable here can elevate anything, and a route added to
+                        // /me later cannot be forgotten from this list. That omission is
+                        // exactly the bug this comment exists to prevent.
+                        .requestMatchers("/api/v1/merchants/me").authenticated()
                         .requestMatchers("/api/v1/merchants/**").hasRole("ADMIN")
                         .anyRequest().authenticated()
                 )

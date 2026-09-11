@@ -29,6 +29,20 @@ public class MerchantController {
      * removed merchantId from CreatePaymentRequest on Day 9. The identity comes from
      * the credential, which both auth filters resolve to the merchant id.
      */
+    /**
+     * Reads the caller's own record. Closes the asymmetry left by the PATCH below,
+     * which let a merchant WRITE its webhook URL with no way to read it back.
+     *
+     * Note that @GetMapping("/{id}") below also matches this URL. Spring MVC picks
+     * this one because it resolves by pattern SPECIFICITY - a literal segment beats
+     * a template variable - which is a different rule from Spring Security's
+     * first-match-wins. Two matching systems, two rules, same application.
+     */
+    @GetMapping("/me")
+    public Merchant getMe(Authentication authentication) {
+        return merchantService.getById(authentication.getName());
+    }
+
     @PatchMapping("/me")
     public Merchant updateMyWebhook(Authentication authentication,
                                     @Valid @RequestBody UpdateWebhookRequest request) {
