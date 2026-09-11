@@ -101,14 +101,21 @@ public class MerchantService {
         return merchantRepository.save(merchant);
     }
 
-    public Merchant update(String id, Merchant updated) {
-        Merchant existing = merchantRepository.findById(id).orElse(null);
-        if (existing == null) {
-            return null;
-        }
-        existing.setName(updated.getName());
-        existing.setEmail(updated.getEmail());
-        existing.setBusinessName(updated.getBusinessName());
+    /**
+     * Loads the existing row and copies the three editable fields onto it, so the
+     * password, the API key hash, the role and the creation timestamp survive
+     * untouched — they are not in the DTO and never were in scope.
+     *
+     * getById rather than findById(...).orElse(null): returning null made the
+     * controller answer 200 with an EMPTY BODY for a merchant that does not exist,
+     * which a client cannot distinguish from success. It now throws and the handler
+     * turns that into a 404.
+     */
+    public Merchant update(String id, UpdateMerchantRequest request) {
+        Merchant existing = getById(id);
+        existing.setName(request.getName());
+        existing.setEmail(request.getEmail());
+        existing.setBusinessName(request.getBusinessName());
         return merchantRepository.save(existing);
     }
 

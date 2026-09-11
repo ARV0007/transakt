@@ -63,9 +63,14 @@ public class MerchantController {
         return merchantService.getAll();
     }
 
+    /**
+     * ADMIN-only. Binds to a DTO like every other write path — see
+     * UpdateMerchantRequest for why that matters even on a route where a forged
+     * role would change nothing.
+     */
     @PutMapping("/{id}")
-    public Merchant update(@PathVariable String id, @RequestBody Merchant merchant) {
-        return merchantService.update(id, merchant);
+    public Merchant update(@PathVariable String id, @Valid @RequestBody UpdateMerchantRequest request) {
+        return merchantService.update(id, request);
     }
 
     @DeleteMapping("/{id}")

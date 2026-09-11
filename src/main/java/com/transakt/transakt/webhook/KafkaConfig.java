@@ -14,12 +14,15 @@ public class KafkaConfig {
 
     /**
      * Three attempts, two seconds apart, then the record goes to
-     * payment.settled.DLT. A permanently broken merchant endpoint cannot block
+     * payment.settled-dlt. Spring's dead-letter suffix is "-dlt", lowercase and
+     * hyphenated — not ".DLT". A permanently broken merchant endpoint cannot block
      * the partition forever, and nothing is silently dropped — failed
      * deliveries sit in a topic you can inspect and replay.
      */
     @Bean
     public DefaultErrorHandler errorHandler(KafkaTemplate<String, String> kafkaTemplate) {
+        // FixedBackOff's second argument is the number of RETRIES, not of attempts:
+        // one initial delivery plus two retries is three deliveries in total.
         return new DefaultErrorHandler(
                 new DeadLetterPublishingRecoverer(kafkaTemplate),
                 new FixedBackOff(2000L, 2L));
