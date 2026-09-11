@@ -1698,7 +1698,14 @@ builds of three different snapshots, so when they disagree, suspect the artifact
   administrator. `@NotBlank` on password closes the no-password account at the same
   time.
 - `Retry-After` on 429s, computed from the window boundary and rounded up.
-- 41 → 61 tests (44 integration, 17 unit across four classes).
+- **`UpdateMerchantRequest`** for `PUT /merchants/{id}` — the last controller binding
+  a request body to an entity. Also fixed a second bug found alongside it: the
+  service returned `null` for a missing id, so the route answered **200 with an
+  empty body** instead of 404.
+- `DELETE /merchants/{id}` answered **200 with the body `false`** for an id that
+  does not exist. Now 204 or 404 — and no service method in the merchant package
+  signals absence by return value any more.
+- 41 → 68 tests (51 integration, 17 unit across four classes).
 
 **Why**
 
@@ -1733,6 +1740,20 @@ that could never log in.
 - *Scope a security matcher to the path, not the method, when the path cannot be
   forged.* `/me` can only ever mean the caller, so no method reachable there can
   elevate anything — and the next route added to `/me` cannot be left out of the list.
+- *Prefer a rule you can check by reading over one you have to re-verify.* "No
+  controller binds a request body to an entity" is checkable in one pass, forever.
+  "The service ignores the dangerous fields" has to be re-checked every time anyone
+  touches it — which is exactly how signup stayed broken for twenty-two days. The
+  `PUT` route was never an escalation, being ADMIN-only; it was fixed to close the
+  rule rather than to close an exploit.
+- *A 200 that means "not found" is worse than a 500.* A client cannot tell it apart
+  from success. Returning `null` from a service and handing it straight back is the
+  usual way this happens.
+- *Absence signalled by a return VALUE has to be handled by every caller; absence
+  signalled by an exception is handled once.* `update` returned null and `delete`
+  returned false, and both were handed straight back by the controller. Neither
+  failed loudly. Both now throw, and `GlobalExceptionHandler` produces the 404 in
+  one place — the same "prefer what cannot be forgotten" argument as the DTO rule.
 
 **Interview line**
 

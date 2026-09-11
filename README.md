@@ -32,7 +32,7 @@ curl -s https://transakt.onrender.com/api/v1/health
 | **Reconciliation** | A bank call that times out leaves a payment `PENDING`, not `FAILED` — you don't know whether the bank acted. A scheduled sweep asks and settles. |
 | **Transactional outbox** | The `payment.settled` event row commits with the payment. Either both exist or neither does, so an event cannot be lost. |
 | **Kafka + webhooks** | A publisher sweeps unpublished events to Kafka; a consumer delivers them to the merchant with retries and a dead-letter topic. |
-| **61 tests** | 44 integration tests through the full filter chain against a real database, plus 17 unit tests where the behaviour needs a dependency to fail on demand. |
+| **68 tests** | 51 integration tests through the full filter chain against a real database, plus 17 unit tests where the behaviour needs a dependency to fail on demand. |
 
 ---
 
@@ -158,7 +158,7 @@ database at startup, so there is no setup SQL to run and nothing to configure.
 ./mvnw test
 ```
 
-Sixty-one tests, well under a minute. Needs Postgres and Redis reachable on localhost —
+Sixty-eight tests, well under a minute. Needs Postgres and Redis reachable on localhost —
 `docker compose up` provides both. The Kafka listener is disabled in the test profile, so no
 broker is required.
 
@@ -291,8 +291,8 @@ Stated rather than discovered:
 
 - A test for the dead-letter path
 - Distributed locking for the three schedulers — ShedLock, or `FOR UPDATE SKIP LOCKED`
-- A DTO for `PUT /api/v1/merchants/{id}`, which still binds the entity. Admin-only, so not an
-  escalation, but the same shape as the signup bug fixed on Day 25
+- `POST /api/v1/merchants` returns 200, not 201 with a `Location` header. Cosmetic, and changing
+  the status touches the signup assertion in eleven test files
 
 **Later, if the project continues:** refunds as a second event type on the same outbox ·
 `SELECT ... FOR UPDATE SKIP LOCKED` so the schedulers survive more than one instance ·

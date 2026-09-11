@@ -734,7 +734,7 @@ Final order: **JwtAuthFilter → ApiKeyFilter → RateLimitFilter → the rest o
 
 **Fixed windows allow a boundary burst.** Twenty requests at 10:00:59 and twenty more at 10:01:00 is forty in two seconds, despite a limit of twenty per minute. Sliding-window algorithms fix this using Redis sorted sets, at meaningfully more complexity. Fixed window is what most systems ship; knowing *why* it is imperfect is the part worth having.
 
-**No `Retry-After` header.** A well-behaved API tells the client how long to wait. Currently it just says no.
+**No `Retry-After` header.** A well-behaved API tells the client how long to wait, and this one said nothing until Day 25 — it now sends a seconds count, rounded up so it can never be zero.
 
 ### The pattern underneath both
 
@@ -2362,3 +2362,64 @@ worked out.
 And the reason it is written by hand rather than thrown: **filters run before the
 DispatcherServlet**, so `@RestControllerAdvice` cannot catch anything from here. That
 constraint has now shaped three separate pieces of this codebase.
+
+
+## Two rules, and why one of them rots
+
+The signup escalation was fixed with a DTO. `PUT /api/v1/merchants/{id}` was the last
+route still binding `@RequestBody` to an entity, and it was fixed the same way — even
+though it was never exploitable, because the route is ADMIN-only and an administrator
+can already change roles.
+
+Fixing an unexploitable route is worth the paragraph, because of *which* rule it buys.
+
+**Rule A.** *The service ignores the fields the caller must not control.*
+True of signup before the bug — `MerchantService.create` set the id, key, hash,
+timestamp and password. It just never touched `role`. To trust Rule A you have to
+read every service method, hold the whole entity's field list in your head, and
+re-do that every time anyone edits either file. Nobody does this. Signup stayed
+broken for twenty-two days.
+
+**Rule B.** *No controller binds a request body to an entity.*
+
+```bash
+grep -rn "@RequestBody" src/main/java/
+```
+
+Five hits, five DTOs. That is the entire verification, it takes four seconds, and it
+does not depend on anyone remembering anything.
+
+**A rule you can check by reading beats a rule you have to re-verify**, even when the
+second one happens to be true today. The exploitable route is why you notice; the
+unexploitable one is what makes the rule worth stating. A rule with an untested
+exception is not a rule.
+
+### The bug found next door
+
+`update` did this:
+
+```java
+Merchant existing = merchantRepository.findById(id).orElse(null);
+if (existing == null) {
+    return null;
+}
+```
+
+The controller returned that `null` straight to Jackson, so editing a merchant that
+does not exist answered **200 with an empty body**.
+
+That is worse than a 500. A 500 at least tells a client something went wrong; a 200
+tells it everything is fine and hands back nothing, and a client that checks the
+status code — which is what you want clients to do — proceeds as if the edit landed.
+
+The fix is to call `getById`, which already throws `ResourceNotFoundException`, and
+let `GlobalExceptionHandler` turn it into a 404. The shape to watch for is a service
+method that returns `null` to signal absence: the null has to be handled by every
+caller, and the caller that forgets does not fail loudly.
+
+`delete` had the same shape — it returned `false` for a missing id, so `DELETE`
+answered 200 with the body `false`. Both now call `getById` and let it throw, so the
+404 is produced once, in `GlobalExceptionHandler`, rather than depending on every
+caller remembering to check a return value. No method in the merchant package
+signals absence by return value any more, which is the same kind of rule as Rule B
+above: checkable by reading, rather than by remembering.
