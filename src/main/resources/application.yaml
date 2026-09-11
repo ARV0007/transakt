@@ -41,6 +41,10 @@ jwt:
 
 ratelimit:
   requests-per-minute: ${RATE_LIMIT_PER_MINUTE:20}
+  # Counted per client address, before authentication. Deliberately much lower than
+  # the API ceiling: five guesses a minute is generous for a human typing a password
+  # and useless for a script.
+  login-attempts-per-minute: ${LOGIN_RATE_LIMIT_PER_MINUTE:5}
 
 outbox:
   topic: ${OUTBOX_TOPIC:payment.settled}

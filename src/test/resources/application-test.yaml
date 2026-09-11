@@ -16,6 +16,10 @@ spring:
 
 ratelimit:
   requests-per-minute: 10000
+  # Thirteen test classes call /auth/login, and under MockMvc every request comes
+  # from 127.0.0.1 — so they would all share one counter. LoginRateLimitIntegrationTest
+  # overrides this with @TestPropertySource, which also gives it its own context.
+  login-attempts-per-minute: 10000
 
 bank:
   decline-rate: 0

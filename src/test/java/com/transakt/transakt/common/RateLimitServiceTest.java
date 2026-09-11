@@ -21,7 +21,7 @@ class RateLimitServiceTest {
         when(ops.increment(anyString()))
                 .thenThrow(new RedisConnectionFailureException("Redis is down"));
 
-        RateLimitService service = new RateLimitService(redis, 20);
+        RateLimitService service = new RateLimitService(redis, 20, 5);
 
         assertThat(service.isAllowed("merchant-123")).isTrue();
     }
