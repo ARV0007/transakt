@@ -119,11 +119,17 @@ public class MerchantService {
         return merchantRepository.save(existing);
     }
 
-    public boolean delete(String id) {
-        if (!merchantRepository.existsById(id)) {
-            return false;
-        }
-        merchantRepository.deleteById(id);
-        return true;
+    /**
+     * Throws rather than returning a boolean, for the same reason update stopped
+     * returning null: absence signalled by a return VALUE has to be handled by
+     * every caller, and the caller that forgets fails silently. Absence signalled
+     * by an exception is handled once, in GlobalExceptionHandler, and cannot be
+     * forgotten.
+     *
+     * getById does the lookup and throws ResourceNotFoundException if there is
+     * nothing there, so the 404 costs no extra query.
+     */
+    public void delete(String id) {
+        merchantRepository.delete(getById(id));
     }
 }

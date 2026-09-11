@@ -1,6 +1,7 @@
 package com.transakt.transakt.merchant;
 
 import jakarta.validation.Valid;
+import org.springframework.http.HttpStatus;
 import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.*;
 
@@ -73,8 +74,17 @@ public class MerchantController {
         return merchantService.update(id, request);
     }
 
+    /**
+     * 204 No Content: the delete succeeded and there is nothing to return. An id
+     * that does not exist throws from the service and becomes a 404.
+     *
+     * This used to return a boolean, which meant a missing merchant answered 200
+     * with the body `false` — indistinguishable from success to any client that
+     * reads the status code.
+     */
     @DeleteMapping("/{id}")
-    public boolean delete(@PathVariable String id) {
-        return merchantService.delete(id);
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    public void delete(@PathVariable String id) {
+        merchantService.delete(id);
     }
 }
