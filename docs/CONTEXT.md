@@ -417,7 +417,7 @@ The Neon database, built empty on Day 23, reports eight.
   falls back, so one artifact still runs on the Mac, in compose and on Render. A hardcoded
   `require` would break local development; a hardcoded `disable` would break Neon. The variable
   is what keeps both true.
-- **The Kafka listener is disarmed in tests** (Day 23). `auto-startup: false` creates the
+- **The Kafka listener is disarmed by default** (in tests since Day 23, everywhere else since Day 25). `auto-startup: false` creates the
   listener container and leaves it stopped. Nothing loses coverage — the only publishing test is
   a unit test with a mocked template, and since Day 24 the consumer is pinned by a unit test that
   intercepts its `RestClient` instead of needing a broker.

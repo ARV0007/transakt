@@ -1386,7 +1386,7 @@ Three deliberate details:
 
 Two fixes that produced no user-visible change and made everything more trustworthy.
 
-**The Kafka listener is disarmed in tests.** `auto-startup: false` creates the listener container and leaves it stopped, so CI needs no broker. Nothing is lost: the publisher is covered by a unit test with a mocked `KafkaTemplate`, and the consumer by a unit test that intercepts its HTTP client.
+**The Kafka listener is disarmed by default; docker-compose is the only environment that opts in.** `auto-startup: false` creates the listener container and leaves it stopped, so CI needs no broker. Nothing is lost: the publisher is covered by a unit test with a mocked `KafkaTemplate`, and the consumer by a unit test that intercepts its HTTP client.
 
 **A misplaced `bank:` block.** In `application-test.yaml`, a correctly spelled `bank:` key sat at the wrong level of nesting. YAML does not complain about that — it silently ignores it and the defaults apply. The tests still passed, for the wrong reason: bank decisions were random rather than deterministic, so the suite was flaky and slow. Fixing the indentation made it deterministic and roughly twice as fast.
 
