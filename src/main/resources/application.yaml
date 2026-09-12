@@ -15,6 +15,14 @@ spring:
         format_sql: true
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    listener:
+      # Defaults to FALSE because most environments this runs in have no broker.
+      # Render does not: the consumer would sit retrying localhost:9092 at every
+      # boot, which is slow on a 0.1-CPU instance and once cost a deploy its
+      # health check. docker-compose sets it true, where a broker really exists.
+      # Same shape as WEBHOOK_ALLOW_PRIVATE_TARGETS - the inert default is the
+      # one that is correct when somebody forgets to set it.
+      auto-startup: ${KAFKA_LISTENER_AUTO_STARTUP:false}
     producer:
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
       value-serializer: org.apache.kafka.common.serialization.StringSerializer

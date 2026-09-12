@@ -67,6 +67,8 @@ services:
       JWT_SECRET: transakt-dev-secret-key-change-me-min-32-chars
       # Local only. Lets webhooks reach localhost and container hostnames.
       WEBHOOK_ALLOW_PRIVATE_TARGETS: "true"
+      # A broker does exist here, so the consumer should actually run.
+      KAFKA_LISTENER_AUTO_STARTUP: "true"
     depends_on:
       postgres:
         condition: service_healthy
