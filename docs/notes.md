@@ -734,7 +734,7 @@ Final order: **JwtAuthFilter → ApiKeyFilter → RateLimitFilter → the rest o
 
 **Fixed windows allow a boundary burst.** Twenty requests at 10:00:59 and twenty more at 10:01:00 is forty in two seconds, despite a limit of twenty per minute. Sliding-window algorithms fix this using Redis sorted sets, at meaningfully more complexity. Fixed window is what most systems ship; knowing *why* it is imperfect is the part worth having.
 
-**No `Retry-After` header.** A well-behaved API tells the client how long to wait, and this one said nothing until Day 25 — it now sends a seconds count, rounded up so it can never be zero.
+**There was no `Retry-After` header** until Day 25. A well-behaved API tells the client how long to wait, and this one said nothing — it now sends a seconds count, rounded up so it can never be zero.
 
 ### The pattern underneath both
 
