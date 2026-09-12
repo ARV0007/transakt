@@ -1,6 +1,8 @@
 package com.transakt.transakt;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.PersistenceContext;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
@@ -37,6 +39,9 @@ class MerchantMeIntegrationTest {
 
     @Autowired
     private ObjectMapper objectMapper;
+
+    @PersistenceContext
+    private EntityManager entityManager;
 
     private String json(Object object) throws Exception {
         return objectMapper.writeValueAsString(object);
@@ -92,6 +97,18 @@ class MerchantMeIntegrationTest {
     void theResponseCarriesNoSecrets() throws Exception {
         createMerchant("me-secrets@shop.com");
         String token = tokenFor("me-secrets@shop.com");
+
+        // The whole test runs in ONE transaction, so signup's Merchant is still
+        // managed here with its @Transient apiKey populated - MerchantService.create
+        // sets it on the instance after save(). findById would then hand back that
+        // same object out of the first-level cache rather than a fresh row, and the
+        // key would appear in the response for a reason that cannot happen in
+        // production, where every request has its own persistence context.
+        //
+        // flush() pushes the pending insert to the database; clear() detaches
+        // everything, restoring the boundary the shared transaction erases.
+        entityManager.flush();
+        entityManager.clear();
 
         mockMvc.perform(get("/api/v1/merchants/me")
                         .header("Authorization", "Bearer " + token))

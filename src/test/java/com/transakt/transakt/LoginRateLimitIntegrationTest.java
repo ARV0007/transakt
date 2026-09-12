@@ -105,7 +105,10 @@ class LoginRateLimitIntegrationTest {
                 .andReturn().getResponse().getContentAsString();
         String token = objectMapper.readTree(body).get("token").asText();
 
-        for (int i = 0; i < 3; i++) {
+        // The successful login above already spent one of the three, so only two
+        // more are allowed before the ceiling. Counting the request you needed in
+        // order to set the test up is exactly the arithmetic that is easy to miss.
+        for (int i = 0; i < 2; i++) {
             attemptLogin("nobody@shop.com", "wrong-password", 401);
         }
         attemptLogin("nobody@shop.com", "wrong-password", 429);
