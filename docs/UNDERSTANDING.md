@@ -1591,11 +1591,12 @@ returned an administrator. `/api/v1/merchants/**` is `hasRole("ADMIN")`, so that
 >
 > **Rule B.** *No controller binds a request body to an entity.*
 > ```bash
-> grep -rn "@RequestBody" src/main/java/ | grep "public "
+> grep -rn "@RequestBody" src/main/java/ --include='*Controller.java'
 > ```
 > Five hits, five DTOs: `LoginRequest`, `CreatePaymentRequest`, `CreateMerchantRequest`,
 > `UpdateWebhookRequest`, `UpdateMerchantRequest`. Four seconds, and it depends on nobody
-> remembering anything. The `grep "public "` matters — without it a sixth line turns up,
+> remembering anything. The quoted `--include` matters: unquoted, zsh expands the glob
+> itself and grep never sees it. Without it a sixth line turns up,
 > a javadoc in `UpdateMerchantRequest` that mentions `@RequestBody` in prose. A check
 > whose output you cannot predict exactly is not the kind of check this rule is claiming
 > to be.
