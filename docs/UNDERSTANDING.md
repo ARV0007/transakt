@@ -1591,9 +1591,14 @@ returned an administrator. `/api/v1/merchants/**` is `hasRole("ADMIN")`, so that
 >
 > **Rule B.** *No controller binds a request body to an entity.*
 > ```bash
-> grep -rn "@RequestBody" src/main/java/
+> grep -rn "@RequestBody" src/main/java/ | grep "public "
 > ```
-> Five hits, five DTOs. Four seconds, and it depends on nobody remembering anything.
+> Five hits, five DTOs: `LoginRequest`, `CreatePaymentRequest`, `CreateMerchantRequest`,
+> `UpdateWebhookRequest`, `UpdateMerchantRequest`. Four seconds, and it depends on nobody
+> remembering anything. The `grep "public "` matters — without it a sixth line turns up,
+> a javadoc in `UpdateMerchantRequest` that mentions `@RequestBody` in prose. A check
+> whose output you cannot predict exactly is not the kind of check this rule is claiming
+> to be.
 
 **A rule you can check by reading beats a rule you have to re-verify**, even when the second happens to be true today. A rule with an untested exception is not a rule.
 
