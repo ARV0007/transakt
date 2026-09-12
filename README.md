@@ -32,7 +32,7 @@ curl -s https://transakt.onrender.com/api/v1/health
 | **Reconciliation** | A bank call that times out leaves a payment `PENDING`, not `FAILED` — you don't know whether the bank acted. A scheduled sweep asks and settles. |
 | **Transactional outbox** | The `payment.settled` event row commits with the payment. Either both exist or neither does, so an event cannot be lost. |
 | **Kafka + webhooks** | A publisher sweeps unpublished events to Kafka; a consumer delivers them to the merchant with retries and a dead-letter topic. |
-| **68 tests** | 51 integration tests through the full filter chain against a real database, plus 17 unit tests where the behaviour needs a dependency to fail on demand. |
+| **70 tests** | 53 integration tests through the full filter chain against a real database, plus 17 unit tests where the behaviour needs a dependency to fail on demand. |
 
 ---
 
@@ -158,7 +158,7 @@ database at startup, so there is no setup SQL to run and nothing to configure.
 ./mvnw test
 ```
 
-Sixty-eight tests, well under a minute. Needs Postgres and Redis reachable on localhost —
+Seventy tests, well under a minute. Needs Postgres and Redis reachable on localhost —
 `docker compose up` provides both. The Kafka listener is disabled in the test profile, so no
 broker is required.
 
@@ -252,8 +252,10 @@ Stated rather than discovered:
   query crosses the public internet under TLS — safe, slightly slower, one more provider in the
   failure path. Neon also scales to zero after five minutes idle, so the first query after a
   quiet spell pays a wake-up on top of Render's own cold start.
-- **Unauthenticated traffic isn't rate limited.** The filter needs an identity to count against,
-  so `/auth/login` has no ceiling. Production gateways add an IP-keyed limiter.
+- **The login limiter trusts `CF-Connecting-IP`.** Behind Cloudflare that header is overwritten
+  by the proxy and safe to use; exposed without one, anyone could set it per request and evade the
+  limit. It falls back to `getRemoteAddr()`, which behind a proxy is the proxy — so the limit would
+  become global. Verify against the deployed instance before relying on it.
 - **Fixed-window rate limiting allows a boundary burst** — 20 either side of a minute boundary is
   40 in two seconds. Sliding windows via sorted sets fix it at more complexity.
 - **Idempotency keys aren't fingerprinted against the request body.** Reusing a key with a

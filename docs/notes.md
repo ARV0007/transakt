@@ -730,7 +730,7 @@ Final order: **JwtAuthFilter → ApiKeyFilter → RateLimitFilter → the rest o
 
 ### Known limitations
 
-**Unauthenticated traffic isn't limited at all.** The filter guards on `auth != null`, so someone brute-forcing `/auth/login` with bad passwords hits no ceiling. Production gateways add a second limiter keyed by IP address for exactly this.
+**Unauthenticated traffic wasn't limited at all** until Day 25. The filter guarded on `auth != null`, so someone brute-forcing `/auth/login` with bad passwords hit no ceiling. The fix is a second counter keyed on the client address: `CF-Connecting-IP` where present, falling back to `getRemoteAddr()`. Two things make it harder than it looks. Behind a proxy `getRemoteAddr()` is the *proxy*, so counting it would treat the whole internet as one client and lock everybody out after five attempts — a denial of service against yourself rather than a limiter. And `X-Forwarded-For`, the header most people reach for, is *appended* to, so its leftmost entry is whatever the caller claimed and is trivially forged; Cloudflare's `CF-Connecting-IP` is safe only because Cloudflare overwrites it. The limiter is therefore only as trustworthy as the proxy in front of it, which is written into the javadoc rather than hidden. It counts attempts rather than successes, because the filter runs before the controller and an attacker's requests all fail by definition.
 
 **Fixed windows allow a boundary burst.** Twenty requests at 10:00:59 and twenty more at 10:01:00 is forty in two seconds, despite a limit of twenty per minute. Sliding-window algorithms fix this using Redis sorted sets, at meaningfully more complexity. Fixed window is what most systems ship; knowing *why* it is imperfect is the part worth having.
 

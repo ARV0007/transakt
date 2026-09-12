@@ -67,7 +67,7 @@ That is deliberate — a container that starts in two seconds and can be thrown 
 shared remote database, and the parameterised config means the same image works against either.
 
 **To run everything locally:** `docker compose up` — Postgres, Redis, Kafka and the app.
-**To run the tests:** all three stores up, then `./mvnw test`. Expect 68 tests, well under a minute.
+**To run the tests:** all three stores up, then `./mvnw test`. Expect 70 tests, well under a minute.
 **Before running the app bare:** `lsof -ti :8080 | xargs kill` — a leftover instance is the usual
 cause of "port already in use", and a failed startup means Flyway never ran.
 
@@ -185,7 +185,7 @@ until Day 23, which nested it under `ratelimit:` and made it invisible.
 | 22 | **End-to-end verification** of the retry and dead-letter path; docs to v1.6 |
 | 23 | **Kafka listener disarmed in tests** so CI no longer needs a broker; **misplaced `bank:` block** in the test profile found and fixed (suite twice as fast, decisions deterministic); **Postgres moved to Neon**, `sslmode` parameterised |
 | 24 | **Docs corrected** — the test count was wrong in five places, and both halves of "27 integration plus 2 unit" were wrong too; **`eventId` in the webhook payload** carrying the outbox row's primary key, three-argument `OutboxEvent` constructor deleted so the two cannot diverge; **`RetentionSweeper`** — hourly, seven-day outbox and 24-hour idempotency windows, `@Modifying @Query` deletes, V9 indexes; **`PATCH /api/v1/merchants/me`** with format validation, a security matcher above the ADMIN rule, and the SSRF exposure documented |
-| 25 | **SSRF guard** — `WebhookTargetValidator` resolves the host immediately before the POST and refuses loopback, link-local, site-local and unresolvable targets; `WEBHOOK_ALLOW_PRIVATE_TARGETS` defaults to false so a forgotten variable fails safe; **`GET /api/v1/merchants/me`**, with the `/me` security matcher no longer scoped to one HTTP method; **signup privilege escalation fixed** — `POST /api/v1/merchants` bound the body onto the `Merchant` entity, so an unauthenticated `{"role":"ADMIN"}` produced an administrator. `CreateMerchantRequest` has no role field, and `@NotBlank` on password closes the account that could never log in; **`Retry-After` on 429s**, rounded up so it is never zero; **`PUT /api/v1/merchants/{id}` moved onto `UpdateMerchantRequest`** — the last controller binding a body to an entity — and fixed to return 404 instead of 200-with-an-empty-body for an id that does not exist; **`DELETE /api/v1/merchants/{id}`** now answers 204 or 404 rather than 200 with the body `false` |
+| 25 | **SSRF guard** — `WebhookTargetValidator` resolves the host immediately before the POST and refuses loopback, link-local, site-local and unresolvable targets; `WEBHOOK_ALLOW_PRIVATE_TARGETS` defaults to false so a forgotten variable fails safe; **`GET /api/v1/merchants/me`**, with the `/me` security matcher no longer scoped to one HTTP method; **signup privilege escalation fixed** — `POST /api/v1/merchants` bound the body onto the `Merchant` entity, so an unauthenticated `{"role":"ADMIN"}` produced an administrator. `CreateMerchantRequest` has no role field, and `@NotBlank` on password closes the account that could never log in; **`Retry-After` on 429s**, rounded up so it is never zero; **`PUT /api/v1/merchants/{id}` moved onto `UpdateMerchantRequest`** — the last controller binding a body to an entity — and fixed to return 404 instead of 200-with-an-empty-body for an id that does not exist; **`DELETE /api/v1/merchants/{id}`** now answers 204 or 404 rather than 200 with the body `false`; **per-IP rate limiting on `/auth/login`** — five attempts a minute, counted before authentication so failed guesses count, keyed on `CF-Connecting-IP` falling back to `getRemoteAddr()` |
 
 Architecture doc is at **v1.9**.
 
@@ -317,6 +317,7 @@ src/test/java/com/transakt/transakt
 ├── OwnershipIntegrationTest                                                (5)
 ├── IdempotencyIntegrationTest                                              (5)
 ├── RateLimitIntegrationTest                                                (3)
+├── LoginRateLimitIntegrationTest      own context — per-IP login ceiling   (2)
 ├── RateLimitServiceTest               unit — mocked StringRedisTemplate    (1)
 ├── ApprovedPaymentIntegrationTest                                          (1)
 ├── DeclinedPaymentIntegrationTest                                          (1)
@@ -331,7 +332,7 @@ src/test/java/com/transakt/transakt
 ├── OutboxPublisherTest                unit — mocked KafkaTemplate          (3)
 ├── WebhookConsumerTest                unit — MockRestServiceServer         (4)
 └── WebhookTargetValidatorTest         unit — literal IPs, no DNS           (9)
-                                                                    total = 68
+                                                                    total = 70
 
 src/test/resources/application-test.yaml    the `test` profile
 ```
@@ -693,7 +694,7 @@ back.
 **Feature work is done and the infrastructure is settled.** Payment gateway, two auth doors,
 double-entry ledger, ownership, idempotency, rate limiting, bank simulator, two-transaction
 settlement, reconciler, outbox, Kafka publisher, webhook consumer with retries and a DLQ.
-68 tests, CI green in under a minute, database on a tier that doesn't expire.
+70 tests, CI green in under a minute, database on a tier that doesn't expire.
 
 **Nothing is currently broken.** No dates on the calendar.
 
@@ -712,7 +713,9 @@ settlement, reconciler, outbox, Kafka publisher, webhook consumer with retries a
 **Smaller, still outstanding:**
 
 - `POST /api/v1/merchants` returns 200, not 201; no password-change endpoint
-- Unauthenticated traffic isn't rate limited; no IP-based limiter
+- The login limiter keys on `CF-Connecting-IP`, falling back to `getRemoteAddr()`. Behind a
+  proxy that fallback is the proxy's own address, which would make the ceiling global instead
+  of per client — verify against the deployed instance before relying on it
 - Fixed-window rate limiting allows a boundary burst
 - Idempotency keys aren't fingerprinted against the request body (Stripe returns 422)
 - The idempotency race path is untested — the test class is `@Transactional`, so a constraint

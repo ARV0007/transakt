@@ -1705,7 +1705,10 @@ builds of three different snapshots, so when they disagree, suspect the artifact
 - `DELETE /merchants/{id}` answered **200 with the body `false`** for an id that
   does not exist. Now 204 or 404 — and no service method in the merchant package
   signals absence by return value any more.
-- 41 → 68 tests (51 integration, 17 unit across four classes).
+- **Per-IP rate limiting on `/auth/login`.** The per-merchant limiter keys on an id
+  that only exists after authentication, so login had no ceiling at all and
+  passwords could be guessed as fast as the network allowed.
+- 41 → 70 tests (53 integration, 17 unit across four classes).
 
 **Why**
 
@@ -1749,6 +1752,15 @@ that could never log in.
 - *A 200 that means "not found" is worse than a 500.* A client cannot tell it apart
   from success. Returning `null` from a service and handing it straight back is the
   usual way this happens.
+- *Behind a proxy, `getRemoteAddr()` is the proxy.* An IP limiter that uses it
+  unguarded treats the whole internet as one client — the sixth login attempt
+  globally locks everybody out. Cloudflare's `CF-Connecting-IP` is safe because
+  Cloudflare OVERWRITES it; `X-Forwarded-For` is appended to, so its leftmost entry
+  is whatever the caller claimed and is trivially forged. The trust boundary has to
+  be stated: the header is only as good as the proxy in front of it.
+- *Limit attempts, not successes.* The filter runs before the controller, so a
+  wrong password still counts. A limiter that only counted successful logins would
+  be no obstacle to guessing passwords at all.
 - *Absence signalled by a return VALUE has to be handled by every caller; absence
   signalled by an exception is handled once.* `update` returned null and `delete`
   returned false, and both were handed straight back by the controller. Neither
