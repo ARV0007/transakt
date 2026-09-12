@@ -2423,3 +2423,77 @@ answered 200 with the body `false`. Both now call `getById` and let it throw, so
 caller remembering to check a return value. No method in the merchant package
 signals absence by return value any more, which is the same kind of rule as Rule B
 above: checkable by reading, rather than by remembering.
+
+## Counting someone you cannot name
+
+The per-merchant rate limiter cannot protect the login endpoint, and the reason is
+structural rather than an oversight: it keys on a merchant id, and a merchant id only
+exists once you are authenticated. **The whole point of attacking login is not being
+authenticated yet.** So for twenty-five days, `/api/v1/auth/login` had no ceiling and
+passwords could be guessed as fast as the network allowed.
+
+The fix is a second counter keyed on the client's address instead:
+
+```java
+} else if (LOGIN_PATH.equals(request.getRequestURI())) {
+    if (!rateLimitService.isLoginAllowed(clientIp(request))) { reject(response); return; }
+}
+```
+
+Three things in that are worth more than the code.
+
+### Limit attempts, not successes
+
+The filter runs **before** the controller, so a request with a wrong password is
+counted exactly like one with a right password. That is the point. A limiter placed
+after authentication, or one that only counted successful logins, would be no
+obstacle whatsoever to guessing — the attacker's requests all fail, and failing is
+what they are doing.
+
+### Behind a proxy, `getRemoteAddr()` is the proxy
+
+This is the trap, and it is worse than it looks: it does not weaken the limiter, it
+turns the limiter into an outage.
+
+Render sits behind Cloudflare. If you count `getRemoteAddr()` there, every request on
+the planet arrives from the same handful of edge addresses — so the sixth login
+attempt *globally*, in any given minute, locks out every merchant. You have not built
+brute-force protection, you have built a denial of service against yourself.
+
+The header to trust is **`CF-Connecting-IP`**, because Cloudflare *overwrites* it.
+
+**`X-Forwarded-For` is the wrong answer**, and it is the one most people reach for.
+XFF is *appended* to as a request passes through proxies, so its leftmost entry is
+whatever the original caller claimed. An attacker sets a fresh forged value on every
+request and the counter never reaches two.
+
+```java
+private String clientIp(HttpServletRequest request) {
+    String cloudflare = request.getHeader("CF-Connecting-IP");
+    if (cloudflare != null && !cloudflare.isBlank()) {
+        return cloudflare;
+    }
+    return request.getRemoteAddr();
+}
+```
+
+### The trust boundary is part of the design
+
+That method is only correct **behind a proxy that overwrites the header**. Exposed
+directly to the internet, anyone could set `CF-Connecting-IP` themselves and the
+limit would be worthless.
+
+That is not a flaw to hide, it is a property to write down, and it is written into
+the javadoc. Every header-based IP decision in every application has this boundary;
+the difference between a good implementation and a bad one is whether somebody stated
+where it sits. It is also why the limiter needs verifying against the *deployed*
+instance rather than assumed — six wrong logins should produce a 429, and if they do
+not, the fallback is in play and the ceiling is global.
+
+### Why it fails open too
+
+Same as its sibling, same reasoning applied to a different question: which failure is
+worse? Failing closed means a Redis blip locks every human out of the dashboard.
+Failing open means losing brute-force protection for a few minutes — against BCrypt
+at cost 10, which is deliberately slow, and only for an attacker who has also managed
+to knock over your Redis.

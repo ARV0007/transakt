@@ -3,7 +3,7 @@
 **A from-scratch walkthrough. Every step, why it was taken, and what you'd be asked about it.**
 
 Repo: github.com/ARV0007/transakt · Live: https://transakt.onrender.com
-Covers Days 1–24 · architecture v1.8 · 41 tests · Flyway V1–V9
+Covers Days 1–25 · architecture v1.9 · 70 tests · Flyway V1–V9
 
 ---
 
@@ -173,7 +173,7 @@ DELETE FROM idempotency_keys WHERE created_at < '2026-09-07';
 **Maven** is the build tool. `pom.xml` lists your dependencies; Maven downloads them, compiles your code, runs your tests, and packages everything into one **JAR** file — a zip containing your compiled classes plus every library, plus an embedded Tomcat web server. `java -jar app.jar` and the server is running. There is no separate server to install.
 
 ```bash
-./mvnw test        # compile + run all 41 tests
+./mvnw test        # compile + run all 70 tests
 ./mvnw package     # build the JAR
 ```
 
@@ -570,7 +570,7 @@ That exception is caught by `GlobalExceptionHandler`, a class marked `@RestContr
 | 429 | Rate limited | Explicitly "slow down", not "you are wrong" |
 
 > **⚑ "Why is 429 separate from 403? Both are refusals."**
-> Because they tell the client to do opposite things. 403 means *stop, this will never work*. 429 means *this will work, wait and retry*. A client that treats 429 as 403 gives up on a request that would have succeeded; one that treats 403 as 429 hammers your server forever. A proper 429 also carries a `Retry-After` header telling the client how long to wait — Transakt does not send one yet, and that is on the known-limitations list.
+> Because they tell the client to do opposite things. 403 means *stop, this will never work*. 429 means *this will work, wait and retry*. A client that treats 429 as 403 gives up on a request that would have succeeded; one that treats 403 as 429 hammers your server forever. A proper 429 also carries a `Retry-After` header telling the client how long to wait; Transakt sends one, as a seconds count rounded up so it can never be zero.
 ---
 
 # Chapter 7 — Day 7: API keys and the filter chain
@@ -841,7 +841,7 @@ Why the key includes the minute: it makes the window self-cleaning. A new minute
 > This is the most interesting design decision in the file, so explain the reasoning: a rate limiter exists to **protect availability**. If it takes the whole API down when its own datastore blips, it has caused exactly the outage it was there to prevent. Losing rate limiting for a few minutes is much cheaper than losing the API. The counter-argument is that fail-open means an attacker who can knock over your Redis has also disabled your protection — which is why you fail open on a *connection* error specifically, not on every exception.
 
 > **⚑ "Who isn't rate limited?"**
-> Unauthenticated callers, because the filter runs after authentication and counts per merchant. That means `/api/v1/auth/login` has **no ceiling at all** — you can brute-force passwords as fast as the network allows. The fix is an IP-based limiter in front. It is a genuine gap and it is on the list.
+> Nobody, now. It used to be unauthenticated callers, because the filter counts per merchant and a merchant id only exists after authentication — so `/api/v1/auth/login` had no ceiling and passwords could be guessed as fast as the network allowed. Since Day 25 a second counter keys on the client address instead. Section 21.9 covers why that is harder than it sounds.
 
 ---
 
@@ -853,7 +853,7 @@ Everything is verified by hand with curl. Nothing catches a regression.
 
 ## What we did
 
-An integration test suite against a real database and a real Redis, with a separate `transakt_test` database and an `application-test.yaml` profile. Today: **41 tests**, 34 integration and 7 unit.
+An integration test suite against a real database and a real Redis, with a separate `transakt_test` database and an `application-test.yaml` profile. Today: **70 tests**, 53 integration and 17 unit.
 
 ## Why mostly integration tests
 
@@ -932,7 +932,7 @@ Config becomes `ddl-auto: validate` — Hibernate now only *checks* that the sch
 > At application startup, before Hibernate validates. Which has an important consequence: **a failed boot performs no migration at all.** During the Day 14 outage this mattered — the app was dying after migrations had already applied, so the database was fine and the logs were misleading.
 
 > **⚑ "Your dev database was 'baselined' but the test one wasn't. Why the difference?"**
-> Dev already had a schema when Flyway arrived, so `baseline-on-migrate: true` tells Flyway "treat what exists as V1 and carry on from V2". The test profile sets it **false** on purpose, so a non-empty test schema fails loudly instead of silently skipping V1. The consequence is genuinely useful: `transakt_test` is the only place V1 through V9 execute as real SQL, which makes **`./mvnw test` the proof that the migrations are correct**. On Day 24 this paid off directly — if V9 had bad SQL, all 41 tests would have gone red rather than the migration failing silently.
+> Dev already had a schema when Flyway arrived, so `baseline-on-migrate: true` tells Flyway "treat what exists as V1 and carry on from V2". The test profile sets it **false** on purpose, so a non-empty test schema fails loudly instead of silently skipping V1. The consequence is genuinely useful: `transakt_test` is the only place V1 through V9 execute as real SQL, which makes **`./mvnw test` the proof that the migrations are correct**. On Day 24 this paid off directly — if V9 had bad SQL, every test would have gone red rather than the migration failing silently.
 
 ## Expand/contract: changing a schema without downtime
 
@@ -1113,7 +1113,7 @@ Three transferable lessons:
 
 ## The situation
 
-41 tests that run when someone remembers to run them.
+A test suite that runs when someone remembers to run it.
 
 ## What we did
 
@@ -1395,7 +1395,7 @@ Two fixes that produced no user-visible change and made everything more trustwor
 
 ---
 
-# Chapter 21 — Day 24: event ids, retention, and the webhook endpoint
+# Chapter 21 — Days 24–25: event ids, retention, and hardening
 
 ## 21.1 The event id
 
@@ -1491,10 +1491,145 @@ This is **server-side request forgery**. What makes a webhook URL different from
 
 **Format validation cannot fix it, and neither can resolving the hostname at write time.** A name that resolves to a public address when saved can resolve to `127.0.0.1` when called, because whoever owns the record controls it and its TTL. That is **DNS rebinding**: nothing about the string changed, the destination did. The check therefore belongs at **delivery** time, in `WebhookConsumer`, against the address actually connected to.
 
-**Why it is not closed yet.** No broker is deployed on Render, so `WebhookConsumer` never runs and nothing outbound is ever sent. The hole is real in the code and unreachable in production, which makes it a **blocker on deploying Kafka** rather than a live incident — and it is written into the roadmap in exactly those words.
+**It was shipped open, deliberately, and closed the next day.** No broker is deployed on Render, so `WebhookConsumer` never runs and nothing outbound is ever sent — the hole was real in the code and unreachable in production, which made it a blocker on deploying Kafka rather than a live incident. Section 21.5 is the fix.
 
-> **⚑ "Why did you ship the endpoint before fixing this?"**
-> Because doing it properly needs a profile toggle — the tests point at `merchant.example.com`, which does not resolve, and local development needs `localhost` to work. Adding that correctly is its own change. Shipping the endpoint with the exposure documented in the code, on the roadmap as a Kafka blocker, and unreachable in production is a defensible trade. Shipping it silently would not have been.
+> **⚑ "Why ship an endpoint with a known SSRF hole at all?"**
+> Because closing it properly needed a profile toggle — the tests point at `merchant.example.com`, which does not resolve, and local development needs `localhost` to work — and that is its own change. Shipping it with the exposure written into the code, onto the roadmap as a named blocker, and unreachable in production is a defensible trade. Shipping it silently would not have been. The test of whether that was judgement or an excuse is whether it actually got closed, and it did, the next session.
+
+---
+
+## 21.5 Closing the SSRF hole
+
+**What we did.** `WebhookTargetValidator`, called from `WebhookConsumer` immediately before the POST:
+
+```java
+if (!targetValidator.isAllowed(url)) {
+    log.warn("Refusing to deliver to {} for merchant {} - ...", url, merchantId);
+    return;
+}
+```
+
+It resolves the host and refuses loopback, link-local, site-local, the wildcard address, multicast, and IPv6 unique-local. A host that does not resolve at all is also refused.
+
+**Three decisions worth defending.**
+
+**The check is at delivery, not at write.** That is the entire point, and 21.4 explains why: DNS rebinding means a write-time check can be true when saved and false when called.
+
+**It fails closed, and the escape hatch defaults to off.** `WEBHOOK_ALLOW_PRIVATE_TARGETS` lets local development reach `localhost`, and defaults to `false`. A deploy that forgets the variable **blocks** private targets. The opposite default would mean one missed environment variable silently reopens the hole, with nothing failing and nobody noticing.
+
+**A blocked target is skipped, not thrown on.** Throwing means retry, and a blocked address will never become deliverable — you would spend all three attempts and a dead-letter slot on something permanent. It matches how a merchant with no webhook URL is already handled.
+
+> **⚑ "`isSiteLocalAddress()` already covers the private ranges. Why the extra check?"**
+> For IPv4 it does — `10/8`, `172.16/12`, `192.168/16`. For IPv6 it covers the **deprecated** `fec0::/10`, not `fc00::/7`, which is the range actually used for private IPv6 today. That range would pass every built-in check, so the validator tests the first byte explicitly.
+
+> **⚑ "Why does the loop reject if ANY resolved address is private?"**
+> Because a hostname with one public A record and one pointing at `127.0.0.1` is an attack, not a typo. Accepting on the first good answer would make the guard trivially bypassable.
+
+> **⚑ "Is it completely fixed?"**
+> No, and say so. It is TOCTOU: Java resolves for the check, `RestClient` resolves again to open the socket, and in principle the record could change between them. The complete fix pins the resolved address and connects to it with an explicit `Host` header. Narrowing a hole and knowing exactly how far you narrowed it is a better answer than claiming it is shut.
+
+**The test is a unit test using literal IPs only** — `InetAddress.getAllByName` returns immediately for a literal and performs no DNS lookup, so nine cases run with no network and cannot go flaky.
+
+---
+
+## 21.6 The signup privilege escalation
+
+The most serious bug in the project's history, and it had been there since Day 3.
+
+**The situation.** `POST /api/v1/merchants` took `@RequestBody Merchant` — the entity. Every other write path had a DTO by Day 6; signup was written before DTOs existed and nothing went back for it.
+
+**The attack.** One request, no credentials:
+
+```json
+POST /api/v1/merchants
+{"name":"x","email":"e@x.com","password":"hunter2","role":"ADMIN"}
+```
+
+returned an administrator. `/api/v1/merchants/**` is `hasRole("ADMIN")`, so that account could read, edit and delete every merchant on the platform.
+
+**Why it worked.** Three things lined up, and any two would have been harmless:
+
+1. The controller bound an untrusted body onto a class with a `role` column.
+2. `Merchant.role` has a field initialiser of `MERCHANT` — which looks like a safe default and is not one. **A field initialiser runs at construction. Jackson's setter runs after it.** The default was overwritten before the service ever saw the object.
+3. `MerchantService.create` set the id, key, prefix, hash, timestamp and password — and never touched `role`, because the field looked defaulted.
+
+**The fix.** `CreateMerchantRequest`, with fields for name, email, password and business name. No `role`. A forged one has nowhere to bind and evaporates during deserialisation.
+
+> **⚑ "Why not just `merchant.setRole(MERCHANT)` in the service? One line."**
+> Because it has to be repeated on every path that constructs a merchant, forever, and the one that gets forgotten is a vulnerability. It also leaves `role` visible in the request contract, so a client can reasonably believe it means something. The DTO makes the attack unexpressible rather than rejected — the same move as removing `merchantId` from `CreatePaymentRequest` on Day 9 and giving `/me` no path variable on Day 24. Three instances of one idea, and this was the one that was missed.
+
+> **⚑ "Sixty tests and none of them caught it. Why not?"**
+> Because every one of them sent only fields the API documents. That is the honest limit of a test suite: it checks the requests you thought to write, and an attacker sends the ones you did not. The gap is in the **shape** of the suite, not its coverage, and "a test that sends undocumented fields on purpose" is now its own item on the limitations list.
+
+> **⚑ "Which of your two tests for this actually matters?"**
+> `aRoleInTheSignupBodyIsIgnored` checks what the response *says*. `aMerchantWhoAskedForAdminStillCannotUseAdminRoutes` signs up asking for ADMIN, logs in, calls an admin route and expects 403 — it checks what the credential can *do*. The first would keep passing if someone changed the serialisation while leaving the authority intact. **Assert on what a credential can do, not on what a response says about it.**
+
+`@NotBlank` on the password closed a second gap at the same time: signup used to accept a merchant with no password, creating an account that could never log in.
+
+## 21.7 Two smaller closures
+
+**`GET /api/v1/merchants/me`.** A merchant could write their webhook URL and not read it back. The security matcher for `/me` also stopped being scoped to a single HTTP method — `/me` can only ever mean the caller, so no method reachable there can elevate anything, and the next route added to `/me` cannot be forgotten from the list. That omission is exactly what made `PATCH /me` return 403 the first time.
+
+> **⚑ "`GET /merchants/{id}` also matches `/me`. Which wins?"**
+> `/me`, because Spring MVC resolves by **pattern specificity** — a literal segment beats a template variable — regardless of declaration order. That is the opposite rule from Spring Security's first-match-wins, in the same application. The test asserts the returned id equals the caller's, which is what proves `/me` won rather than a 404 from looking up a merchant literally named "me".
+
+**`Retry-After` on 429s.** A 429 told clients to stop without saying when they could resume. The value is a seconds count computed from the window boundary and **rounded up**, so it is never zero — a client that trusts a zero retries straight back into the same window, and a `Retry-After` that is too short is worse than none at all.
+
+> **⚑ "Why does that calculation live in `RateLimitService` rather than the filter?"**
+> The window boundary is the service's concept. If the algorithm becomes a sliding window or a token bucket, the filter should only have to ask "how long", not know how the answer is worked out.
+
+---
+
+## 21.8 The last entity-bound request body
+
+**The situation.** `PUT /api/v1/merchants/{id}` still took `@RequestBody Merchant`. It was never exploitable — the route is ADMIN-only and an administrator can already change roles — so this is a fix for the *rule*, not for a bug.
+
+**Why fix an unexploitable route.** Because of which rule it buys you.
+
+> **Rule A.** *The service ignores the fields the caller must not control.*
+> True of signup before the escalation. To trust it you must read every service method, hold the entity's whole field list in your head, and redo that whenever anyone edits either file. Nobody does. Signup stayed broken for twenty-two days.
+>
+> **Rule B.** *No controller binds a request body to an entity.*
+> ```bash
+> grep -rn "@RequestBody" src/main/java/
+> ```
+> Five hits, five DTOs. Four seconds, and it depends on nobody remembering anything.
+
+**A rule you can check by reading beats a rule you have to re-verify**, even when the second happens to be true today. A rule with an untested exception is not a rule.
+
+**The bug found next door.** `update` returned `null` for a missing id and the controller handed it straight to Jackson, so editing a merchant that does not exist answered **200 with an empty body**.
+
+> **⚑ "Why is a 200 there worse than a 500?"**
+> A 500 tells the client something went wrong. A 200 tells it everything is fine and returns nothing — and a client that checks the status code, which is what you want clients to do, proceeds as though the edit landed. The fix is `getById`, which already throws, letting `GlobalExceptionHandler` produce a 404.
+
+> **⚑ "Is that pattern anywhere else?"**
+> It was. `delete` returned `false` for a missing id, so `DELETE` answered 200 with the body `false` — fixed the same day, the same way. The shape to watch for is a service method returning `null` or `false` to signal absence: every caller has to handle it, and the one that forgets fails silently. No method in the merchant package does it any more, which is checkable by reading rather than by remembering — the same kind of rule as Rule B above.
+
+> **⚑ "Your admin test needs an ADMIN, but signup can only make a MERCHANT now. How?"**
+> Create the merchant, promote the row through the repository, *then* log in. The order is load-bearing: the JWT carries the role as a claim and is signed at login, so a token minted before the promotion would still say MERCHANT until it expired. The cost of stateless authorisation, showing up as three lines of test setup.
+
+---
+
+## 21.9 Counting someone you cannot name
+
+**The situation.** The per-merchant rate limiter cannot protect login, and the reason is structural rather than an oversight: it keys on a merchant id, and a merchant id only exists once you are authenticated. **The point of attacking login is not being authenticated yet.** So for twenty-five days `/api/v1/auth/login` had no ceiling and passwords could be guessed as fast as the network allowed.
+
+**What we did.** A second counter, keyed on the client's address, checked in the same filter before the controller runs. Five attempts a minute by default against twenty for the API — generous for a human typing a password, useless for a script.
+
+> **⚑ "Your tests all use the wrong password and still expect the limit to fire. Why?"**
+> Because the filter runs before the controller, so a failed attempt counts exactly like a successful one. That is the point: an attacker's requests all fail, and failing is what they are doing. A limiter that only counted successful logins would be no obstacle to guessing passwords at all.
+
+> **⚑ "Just use `getRemoteAddr()`. What's wrong with that?"**
+> Behind a proxy it is the *proxy's* address. Render sits behind Cloudflare, so every request on the planet arrives from a handful of edge addresses — the sixth login attempt globally, in any minute, would lock out every merchant. That is not brute-force protection, it is a denial of service against yourself.
+
+> **⚑ "So use `X-Forwarded-For`."**
+> This is the wrong answer and the one most people give. XFF is **appended** to as a request passes through proxies, so its leftmost entry is whatever the original caller claimed. An attacker sets a fresh forged value on every request and the counter never reaches two. The header to trust behind Cloudflare is `CF-Connecting-IP`, because Cloudflare **overwrites** it.
+
+> **⚑ "Then your limiter is only as good as the proxy in front of it."**
+> Correct, and that is written into the javadoc rather than hidden. Exposed directly to the internet, anyone could set `CF-Connecting-IP` themselves and the limit would be worthless. Every header-based IP decision in every application has this boundary; the difference between a good implementation and a bad one is whether somebody stated where it sits. It also means the limiter needs verifying against the *deployed* instance rather than assumed.
+
+> **⚑ "Fail open or closed?"**
+> Open, like its sibling, and it is the same question applied to a different case: which failure is worse. Failing closed means a Redis blip locks every human out of the dashboard. Failing open means losing brute-force protection for a few minutes — against BCrypt at cost 10, and only for an attacker who has also knocked over your Redis.
 
 ---
 
@@ -1518,7 +1653,7 @@ This is **server-side request forgery**. What makes a webhook URL different from
 | 12 | `PaymentService.settle` **TX2** | Status → `CAPTURED`; CREDIT merchant + DEBIT gateway; one outbox row with the payload. **Commit** |
 | 13 | **Response** | The merchant has their answer. Everything below is asynchronous |
 | 14 | `OutboxPublisher` (5s) | Unpublished rows oldest-first → Kafka `payment.settled`, **keyed by payment id** → stamp `published_at` only after confirmation |
-| 15 | `WebhookConsumer` | `@KafkaListener`, group `transakt-webhooks`. Looks up `webhook_url`, POSTs with timeouts. A 5xx **throws** → retries → `payment.settled-dlt` |
+| 15 | `WebhookConsumer` | `@KafkaListener`, group `transakt-webhooks`. Looks up `webhook_url`, checks the resolved address against `WebhookTargetValidator`, then POSTs with timeouts. A 5xx **throws** → retries → `payment.settled-dlt` |
 | 16 | `RetentionSweeper` (1h) | Published outbox rows > 7 days, idempotency keys > 24 hours |
 | 17 | `PaymentReconciler` | Anything still `PENDING` after 5 minutes gets checked against the bank |
 
@@ -1540,7 +1675,7 @@ This is **server-side request forgery**. What makes a webhook URL different from
 # Chapter 23 — Rapid-fire
 
 **"Tell me about your project."**
-Use this, then offer to go deeper: *"Transakt is a payment gateway I built in Java and Spring Boot. A merchant signs up, gets an API key, and calls one endpoint to create a payment. Behind it, the payment goes to a simulated bank, the result is written to a double-entry ledger in PostgreSQL in the same transaction, and a settlement event goes out through a transactional outbox to Kafka, which drives a webhook back to the merchant. Two authentication doors — API keys for machines, JWTs for humans — idempotency so a retry can't charge twice, per-merchant rate limiting, versioned migrations, 41 tests, CI on every push, and it's deployed and running on Render."*
+Use this, then offer to go deeper: *"Transakt is a payment gateway I built in Java and Spring Boot. A merchant signs up, gets an API key, and calls one endpoint to create a payment. Behind it, the payment goes to a simulated bank, the result is written to a double-entry ledger in PostgreSQL in the same transaction, and a settlement event goes out through a transactional outbox to Kafka, which drives a webhook back to the merchant. Two authentication doors — API keys for machines, JWTs for humans — idempotency so a retry can't charge twice, per-merchant rate limiting, versioned migrations, 70 tests, CI on every push, and it's deployed and running on Render."*
 
 **"What's the hardest bug you fixed?"**
 The three-day deployment outage. Six lines of debug scaffolding in a `CommandLineRunner`, which runs *after* the context refreshes and Tomcat binds — so everything had already succeeded and the app was dying on the victory lap. Found by reading the deploy log's `Caused by` chain bottom-up.
@@ -1566,8 +1701,11 @@ You need to write to a database and publish an event, in two systems, with no tr
 **"Why SHA-256 for API keys but BCrypt for passwords?"**
 A password lookup has an email to find the row first, so a slow salted hash is fine. An API key *is* the identity — there is no other field — so a salted hash would mean comparing against every row. I split it into an indexed prefix plus a SHA-256 hash. SHA-256 is safe because a 256-bit random key is not guessable at any speed; slowness protects weak secrets, and this one is not weak.
 
+**"Tell me about a security bug you found in your own code."**
+Signup bound the request body straight onto the entity, and the entity has a role column — so an unauthenticated POST with `role: ADMIN` created an administrator, and the admin routes let you read and delete every merchant. What made it subtle is that the field *looked* defaulted: `role` had a field initialiser of MERCHANT. But a field initialiser runs at construction and Jackson's setter runs after it, so the default was already gone by the time my service saw the object. I fixed it with a DTO that has no role field, so a forged role has nowhere to bind — the attack can't be expressed rather than being rejected.
+
 **"What's still wrong with it?"**
-Name two or three specifically: SSRF on the webhook URL; the dead-letter path is untested; the schedulers assume a single instance; JWTs can't be revoked early; the API key prefix carries only ~20 bits, so collisions become likely around 1,200 merchants; login has no rate limit.
+Name two or three specifically: the SSRF guard is TOCTOU; the dead-letter path is untested; the schedulers assume a single instance; JWTs can't be revoked early; the API key prefix carries only ~20 bits, so collisions become likely around 1,200 merchants; and the login limiter is only as trustworthy as the proxy in front of it.
 
 **"Did you use AI to build this?"**
 Answer it plainly and pivot to what you can demonstrate: yes, as a teacher and a pair — and then explain any design decision in this document from first principles, including the trade-off you rejected. That is the actual test, and it is the one you can pass.
@@ -1644,7 +1782,7 @@ flowchart TD
   app -->|public internet - TLS required, sslmode=require| pg[(Neon - PostgreSQL 18.6 - Singapore - scales to zero)]
   app -->|private network - no TLS needed| kv[(transakt-redis - Valkey 8 - Singapore)]
   gh[GitHub ARV0007/transakt - branch main] -->|Auto-Deploy on push| build[Render build - multi-stage Dockerfile]
-  gh -->|push or pull request| ci[GitHub Actions - forty-one tests against service containers]
+  gh -->|push or pull request| ci[GitHub Actions - seventy tests against service containers]
   build --> app
   flyway[Flyway V1-V9 - runs at container startup, before Hibernate validates] -.-> pg
   note[Kafka is NOT deployed - it runs only in docker-compose locally] -.-> app
@@ -1753,6 +1891,7 @@ Which day built what, and where in this document it is explained.
 | 21–22 | 5–6 Sep | Outbox V7, Kafka publisher, webhook consumer, V8 | 19 |
 | 23 | 7 Sep | Listener disarmed in tests; misplaced `bank:` block; Neon | 20 |
 | 24 | 8 Sep | `eventId`, `RetentionSweeper` + V9, `PATCH /merchants/me` | 21 |
+| 25 | 11 Sep | SSRF guard; `GET /merchants/me`; signup escalation fixed; `Retry-After`; the last entity-bound body; per-IP login limiting | 21.5–21.9 |
 
 **Day 24's commits:** `d744f60` (docs corrected), `831f0e8` (event id), `da42bfd` (retention), `0c7207a` (PATCH endpoint).
 
@@ -1788,7 +1927,7 @@ UPDATE merchants SET
 `encode(..., 'hex')` produces lowercase hex, which is why the Java uses `HexFormat` lowercase — the two must agree or every backfilled key fails to authenticate. That kind of cross-language agreement is exactly the sort of thing that breaks silently.
 
 > **⚑ "How do you know the migrations are actually correct?"**
-> Because the test profile sets `baseline-on-migrate: false`, `transakt_test` starts empty, and every `./mvnw test` executes V1 through V9 as real SQL. If any migration is malformed, Flyway fails at startup and all 41 tests go red. **The test suite is the proof.** This paid off on Day 24: V9 was written and verified without a single manual `psql` session.
+> Because the test profile sets `baseline-on-migrate: false`, `transakt_test` starts empty, and every `./mvnw test` executes V1 through V9 as real SQL. If any migration is malformed, Flyway fails at startup and every test goes red. **The test suite is the proof.** This paid off on Day 24: V9 was written and verified without a single manual `psql` session.
 
 ---
 
@@ -1866,6 +2005,7 @@ outbox:
 | `GET` | `/api/v1/health` | open | Liveness only. Render's health check path |
 | `POST` | `/api/v1/auth/login` | open | Returns a JWT. **No rate limit** — known gap |
 | `POST` | `/api/v1/merchants` | open | Signup. Returns the API key **once**, ever |
+| `GET` | `/api/v1/merchants/me` | authenticated | The caller's own record. No id in the route |
 | `PATCH` | `/api/v1/merchants/me` | authenticated | Sets the caller's own `webhook_url`. No id in the route |
 | `GET` `PUT` `DELETE` | `/api/v1/merchants/**` | `ROLE_ADMIN` | Administration |
 | `POST` | `/api/v1/payments` | API key or JWT | Accepts `Idempotency-Key` |
@@ -1934,6 +2074,16 @@ Twice in one day, both mine.
 
 **Lesson.** A check that only looks for the shape you expect will not find the one you did not.
 
+## 30.8 Twenty-two days of anonymous admin
+
+**Symptom.** None. Nothing failed, nothing logged, every test passed.
+
+**Cause.** `POST /api/v1/merchants` bound an untrusted request body onto the `Merchant` entity, which has a `role` column. `Merchant.role`'s field initialiser ran at construction; Jackson's setter ran after it; `MerchantService.create` never reset it. An unauthenticated `{"role":"ADMIN"}` produced an administrator with full access to every merchant.
+
+**Found by** reading the signup path while looking for something else entirely, on Day 25.
+
+**Lesson.** A default applied before untrusted input is not a default, it is a suggestion. And a test suite only checks the requests you thought to write — sixty tests, a full integration suite, CI green on every push, and not one of them ever sent a field the API does not document.
+
 ---
 
 # Chapter 31 — Known limitations, complete
@@ -1942,27 +2092,26 @@ Ordered by how much they would matter in production.
 
 | # | Limitation | Fix |
 |---|---|---|
-| 1 | **SSRF** — webhook URL is format-validated only; `http://169.254.169.254/` is accepted | Resolve and reject private/link-local at **delivery** time. **Blocks deploying Kafka** |
+| 1 | **SSRF guard is TOCTOU** — resolved for the check, resolved again by `RestClient` to connect | Pin the resolved address; connect with an explicit `Host` header |
 | 2 | **Dead-letter path untested** — proved only by a manual run | An integration test with an embedded broker |
 | 3 | **Schedulers assume one instance** — publisher, reconciler and sweeper would all double-run | `SELECT ... FOR UPDATE SKIP LOCKED`, or ShedLock |
 | 4 | **JWTs cannot be revoked** before expiry | Short-lived access tokens + refresh tokens |
-| 5 | **Login has no rate limit** — the limiter counts per merchant, after authentication | An IP-based limiter in front |
+| 5 | **The login limiter trusts `CF-Connecting-IP`** — safe behind Cloudflare, worthless if the app is ever exposed directly | State the trust boundary; ignore the header without a proxy |
 | 6 | **API key prefix carries ~20 bits** — `tk_` eats 3 of 8 chars; 50% collision chance near ~1,200 merchants | A longer dedicated random segment in the key format |
 | 7 | **No API key rotation** — a leaked key cannot be replaced | A regenerate endpoint |
-| 8 | **Signup accepts a merchant with no password**, who can then never log in | `@NotBlank` |
-| 9 | **Idempotency keys are not body-fingerprinted** — same key + different body returns the old payment | Hash the body; return 422 on mismatch, as Stripe does |
-| 10 | **Fixed-window rate limiting** allows a boundary burst | Sliding window or token bucket |
-| 11 | **No `Retry-After` on 429s** | One header |
-| 12 | **Offset pagination** degrades with depth and is unstable under inserts | Cursor pagination |
-| 13 | **Only one foreign key exists** — a payment can reference a merchant that does not exist | `@ManyToOne`, or FK constraints in a migration |
-| 14 | **`POST /api/v1/merchants` returns 200**, not 201 with `Location` | Two lines |
-| 15 | **No `GET /api/v1/merchants/me`** — a merchant can write their webhook URL but not read it | One endpoint |
-| 16 | **Health check is liveness only** — returns UP even if Postgres is unreachable | Actuator readiness with dependency checks |
-| 17 | **`jwt.secret` has a working default** — a misconfigured deploy runs rather than failing | Remove the fallback |
-| 18 | **`WORKLOG.md` has four duplicated entries and no Day 15** | A documentation pass |
+| 8 | **Idempotency keys are not body-fingerprinted** — same key + different body returns the old payment | Hash the body; return 422 on mismatch, as Stripe does |
+| 9 | **Fixed-window rate limiting** allows a boundary burst | Sliding window or token bucket |
+| 10 | **Offset pagination** degrades with depth and is unstable under inserts | Cursor pagination |
+| 11 | **Only one foreign key exists** — a payment can reference a merchant that does not exist | `@ManyToOne`, or FK constraints in a migration |
+| 12 | **`POST /api/v1/merchants` returns 200**, not 201 with `Location` | Two lines |
+| 13 | **Health check is liveness only** — returns UP even if Postgres is unreachable | Actuator readiness with dependency checks |
+| 14 | **`jwt.secret` has a working default** — a misconfigured deploy runs rather than failing | Remove the fallback |
+| 15 | **`WORKLOG.md` has four duplicated entries and no Day 15** | A documentation pass |
+| 16 | **No test sends undocumented fields** — the Day 25 escalation survived sixty tests because every one sent only documented fields | A test that posts unexpected keys on purpose |
+| 17 | **`MerchantService.delete` used to return a boolean** — now 204/404; `POST /api/v1/merchants` still returns 200, not 201 with a `Location` header | Two lines, but the status change touches eleven test files |
 
 > **⚑ "That's a long list. Doesn't it make the project look unfinished?"**
-> The opposite, and this is worth internalising. Everyone's project has this list; most candidates have not written it down and cannot answer "what's wrong with it". Being able to name eighteen specific gaps, rank them, and say what the fix is demonstrates that you understand the system rather than that you assembled it. The one that impresses is **#1**, because finding a genuine SSRF vector in your own code and scoping it correctly is not a tutorial exercise.
+> The opposite, and this is worth internalising. Everyone's project has this list; most candidates have not written it down and cannot answer "what's wrong with it". Being able to name 17 specific gaps, rank them, and say what the fix is demonstrates that you understand the system rather than that you assembled it. The one that impresses is **#1**, because finding a genuine SSRF vector in your own code and scoping it correctly is not a tutorial exercise.
 
 ---
 
@@ -1988,11 +2137,11 @@ When any of these change, they change in several places at once. Grep for the ol
 
 | Number | Currently |
 |---|---|
-| Tests | 41 (34 integration, 7 unit) |
+| Tests | 70 (53 integration, 17 unit) |
 | Migrations | V1–V9 |
-| Architecture version | v1.8 |
-| Days | 24 |
-| Endpoints | 9 |
+| Architecture version | v1.9 |
+| Days | 25 |
+| Endpoints | 10 |
 | Known limitations | 18 |
 
 ## Changelog
@@ -2001,6 +2150,9 @@ When any of these change, they change in several places at once. Grep for the ol
 |---|---|---|
 | 1.0 | 24 | Written from scratch, covering Days 1–24. Chapters 1–24 in build order with 46 counter-question boxes |
 | 1.1 | 24 | Folded in the architecture diagrams, day index, migration/config/endpoint references, the failure catalogue, the complete limitations list, and this maintenance chapter |
+| 1.2 | 25 | Day 25 added as sections 21.5–21.7: the SSRF guard, the signup privilege escalation, `GET /me` and `Retry-After`. New failure 30.8, new rapid-fire answer |
+| 1.3 | 25 | Section 21.8 — the last entity-bound request body, and the rule it completes. `DELETE` fixed to 204/404 |
+| 1.4 | 25 | Section 21.9 — per-IP login limiting, and why `X-Forwarded-For` is the wrong header. Counts to 70 |
 
 ---
 
