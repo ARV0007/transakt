@@ -10,6 +10,7 @@ on:
     paths:
       - 'src/main/java/com/transakt/transakt/common/ApiKey*.java'
       - 'src/test/java/com/transakt/transakt/ApiKeyLookupBenchmark.java'
+      - '.github/workflows/benchmark.yml'
 
 permissions:
   contents: read
