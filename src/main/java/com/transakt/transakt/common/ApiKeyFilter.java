@@ -1,5 +1,6 @@
 package com.transakt.transakt.common;
 
+import com.transakt.transakt.common.ApiKeyCache.CachedPrincipal;
 import com.transakt.transakt.merchant.Merchant;
 import com.transakt.transakt.merchant.MerchantRepository;
 import jakarta.servlet.FilterChain;
@@ -20,9 +21,11 @@ import java.util.Optional;
 public class ApiKeyFilter extends OncePerRequestFilter {
 
     private final MerchantRepository merchantRepository;
+    private final ApiKeyCache apiKeyCache;
 
-    public ApiKeyFilter(MerchantRepository merchantRepository) {
+    public ApiKeyFilter(MerchantRepository merchantRepository, ApiKeyCache apiKeyCache) {
         this.merchantRepository = merchantRepository;
+        this.apiKeyCache = apiKeyCache;
     }
 
     @Override
@@ -38,15 +41,17 @@ public class ApiKeyFilter extends OncePerRequestFilter {
             String prefix = ApiKeyHasher.prefixOf(apiKey);
 
             if (prefix != null) {
-                Optional<Merchant> merchant = merchantRepository.findByApiKeyPrefix(prefix);
+                Optional<CachedPrincipal> principal = lookUp(prefix);
 
-                if (merchant.isPresent()
-                        && ApiKeyHasher.matches(apiKey, merchant.get().getApiKeyHash())) {
+                // The comparison runs on every request, cached or not: the cache only
+                // replaces the database lookup, so a wrong key with a real prefix still fails.
+                if (principal.isPresent()
+                        && ApiKeyHasher.matches(apiKey, principal.get().apiKeyHash())) {
                     var authentication = new UsernamePasswordAuthenticationToken(
-                            merchant.get().getId(),
+                            principal.get().merchantId(),
                             null,
                             List.of(new SimpleGrantedAuthority(
-                                    "ROLE_" + merchant.get().getRole().name()))
+                                    "ROLE_" + principal.get().role().name()))
                     );
                     SecurityContextHolder.getContext().setAuthentication(authentication);
                 }
@@ -54,5 +59,21 @@ public class ApiKeyFilter extends OncePerRequestFilter {
         }
 
         filterChain.doFilter(request, response);
+    }
+
+    /**
+     * Cache first, database on a miss. A miss is cached only when the merchant exists:
+     * caching "no such prefix" would let a key minted a moment later be refused until
+     * the negative entry expired.
+     */
+    private Optional<CachedPrincipal> lookUp(String prefix) {
+        Optional<CachedPrincipal> cached = apiKeyCache.get(prefix);
+        if (cached.isPresent()) {
+            return cached;
+        }
+
+        Optional<Merchant> merchant = merchantRepository.findByApiKeyPrefix(prefix);
+        merchant.ifPresent(apiKeyCache::put);
+        return merchant.map(m -> new CachedPrincipal(m.getId(), m.getRole(), m.getApiKeyHash()));
     }
 }

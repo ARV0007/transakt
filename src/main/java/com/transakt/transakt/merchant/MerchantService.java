@@ -1,5 +1,6 @@
 package com.transakt.transakt.merchant;
 
+import com.transakt.transakt.common.ApiKeyCache;
 import com.transakt.transakt.common.ApiKeyHasher;
 import com.transakt.transakt.common.ResourceNotFoundException;
 import org.springframework.security.crypto.password.PasswordEncoder;
@@ -14,11 +15,14 @@ public class MerchantService {
 
     private final MerchantRepository merchantRepository;
     private final PasswordEncoder passwordEncoder;
+    private final ApiKeyCache apiKeyCache;
 
     public MerchantService(MerchantRepository merchantRepository,
-                           PasswordEncoder passwordEncoder) {
+                           PasswordEncoder passwordEncoder,
+                           ApiKeyCache apiKeyCache) {
         this.merchantRepository = merchantRepository;
         this.passwordEncoder = passwordEncoder;
+        this.apiKeyCache = apiKeyCache;
     }
 
     /**
@@ -130,6 +134,14 @@ public class MerchantService {
      * nothing there, so the 404 costs no extra query.
      */
     public void delete(String id) {
-        merchantRepository.delete(getById(id));
+        Merchant merchant = getById(id);
+
+        // Evicted on both sides of the delete. Before: a request arriving now goes to the
+        // database. After: a request that read the row just before the delete may have
+        // re-cached it in between, and this removes that copy too. Without the second
+        // eviction a deleted merchant's key could keep working until the TTL ran out.
+        apiKeyCache.evict(merchant.getApiKeyPrefix());
+        merchantRepository.delete(merchant);
+        apiKeyCache.evict(merchant.getApiKeyPrefix());
     }
 }

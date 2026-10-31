@@ -47,6 +47,11 @@ jwt:
   secret: ${JWT_SECRET:transakt-dev-secret-key-change-me-min-32-chars}
   expiration-ms: 3600000
 
+apikey-cache:
+  # How long a cached API key lookup is trusted. Bounds how long a role changed by hand
+  # in psql takes to apply; deleting a merchant evicts immediately and does not wait.
+  ttl-seconds: ${APIKEY_CACHE_TTL_SECONDS:300}
+
 ratelimit:
   requests-per-minute: ${RATE_LIMIT_PER_MINUTE:20}
   # Counted per client address, before authentication. Deliberately much lower than
