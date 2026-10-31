@@ -2497,3 +2497,24 @@ worse? Failing closed means a Redis blip locks every human out of the dashboard.
 Failing open means losing brute-force protection for a few minutes — against BCrypt
 at cost 10, which is deliberately slow, and only for an attacker who has also managed
 to knock over your Redis.
+
+## Caching the API key lookup
+
+The rule that made this safe to add: **cache the lookup, never the decision.** Redis holds
+the merchant id, role and key hash under `apikey:<prefix>`; the filter still runs
+`ApiKeyHasher.matches` against the presented key every time, so a cache can only ever
+save a query, not let a wrong key through.
+
+Staleness is a short list, and the list is the design:
+
+| What changes | Can it make an entry wrong? | Handled by |
+|---|---|---|
+| Key hash | No - written once at signup | - |
+| Role via the API | No - no endpoint changes it | - |
+| Role by hand in psql | Yes | TTL (5 min, `APIKEY_CACHE_TTL_SECONDS`) |
+| Merchant deleted | Yes | Evicted before and after the delete |
+
+Redis down is a miss, not an error - the filter goes to Postgres as it did before. To
+measure the saving: `./mvnw test -Dtest=ApiKeyLookupBenchmark`, which prints p50/p95 for
+the lookup alone and for a whole request, cache cold versus warm.
+

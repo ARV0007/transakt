@@ -1798,3 +1798,42 @@ Smaller, and mine: I predicted the test counts after each change as 50, 54 and 5
 and they were 51, 55 and 60. `WebhookTargetValidatorTest` has nine tests, not the
 eight I counted. Harmless here because the real number is printed by the build, but
 the same off-by-one in a doc is exactly what the Day 24 pass spent its morning fixing.
+
+## Day 26 — caching the API key lookup (31 Oct 2026)
+
+**Built**
+- `ApiKeyCache` — the merchant behind an API key (id, role, key hash) cached in Redis
+  under `apikey:<prefix>` for five minutes (`apikey-cache.ttl-seconds`).
+- `ApiKeyFilter` reads the cache first and the database on a miss, then caches what
+  it found. The constant-time hash comparison runs on every request either way.
+- `MerchantService.delete` evicts the entry on both sides of the delete.
+- Fails open: an unreachable Redis is a cache miss, so the filter falls back to the
+  database exactly as before. Same reasoning as the rate limiter.
+- `ApiKeyLookupBenchmark` — run on purpose with `./mvnw test -Dtest=ApiKeyLookupBenchmark`;
+  the class name keeps it out of the normal suite.
+- 70 → 79 tests (57 integration, 22 unit). The first integration tests anywhere in the
+  suite that authenticate with `X-API-Key` - until today every test used a JWT.
+
+**Why**
+
+Every request carrying an API key cost a Postgres query before anything else ran, and
+the database is Neon over the public internet, while Redis sits on Render's private
+network next to the app. API keys are read constantly and almost never change, which
+is the shape a cache is for.
+
+**Concepts**
+- *Cache the lookup, not the decision.* The cache stores the hash, and the filter still
+  compares the presented key against it. A cached entry can never make a wrong key pass.
+- *Know exactly what can make an entry stale.* The hash is written once; no endpoint
+  changes a role; deleting a merchant does - so delete evicts, and a role changed by
+  hand in psql applies within the TTL. Writing that list down is the design.
+- *Evict on both sides of a write.* Evicting only before the delete leaves a window
+  where a request that read the row just before it re-caches a deleted merchant.
+- *Don't cache "not found" here.* A negative entry would refuse a key minted a moment
+  later until it expired.
+- *Proving a cache hit.* From outside, a hit and a database read look identical. The
+  test breaks the database copy after the first request; if the second still
+  authenticates, the database was not asked.
+- *Redis is not rolled back.* `@Transactional` undoes Postgres only, so the cache test
+  flushes Redis before each test - the same lesson as Day 11.
+

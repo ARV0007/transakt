@@ -3,7 +3,7 @@
 **A from-scratch walkthrough. Every step, why it was taken, and what you'd be asked about it.**
 
 Repo: github.com/ARV0007/transakt · Live: https://transakt.onrender.com
-Covers Days 1–25 · architecture v1.9 · 70 tests · Flyway V1–V9
+Covers Days 1–26 · architecture v1.10 · 79 tests · Flyway V1–V9
 
 ---
 
@@ -173,7 +173,7 @@ DELETE FROM idempotency_keys WHERE created_at < '2026-09-07';
 **Maven** is the build tool. `pom.xml` lists your dependencies; Maven downloads them, compiles your code, runs your tests, and packages everything into one **JAR** file — a zip containing your compiled classes plus every library, plus an embedded Tomcat web server. `java -jar app.jar` and the server is running. There is no separate server to install.
 
 ```bash
-./mvnw test        # compile + run all 70 tests
+./mvnw test        # compile + run all 79 tests
 ./mvnw package     # build the JAR
 ```
 
@@ -1639,6 +1639,32 @@ returned an administrator. `/api/v1/merchants/**` is `hasRole("ADMIN")`, so that
 
 ---
 
+## 21.10 Caching the API key lookup
+
+**The situation.** Every request with an `X-API-Key` header began with `findByApiKeyPrefix` - a Postgres query, to Neon, over the public internet - before the request did anything useful. API keys are read on every call and almost never change. That is the shape a cache is for.
+
+**What we did.** `ApiKeyCache` keeps the merchant id, role and key hash in Redis under `apikey:<prefix>` for five minutes. `ApiKeyFilter` asks the cache first and Postgres on a miss, caching what it finds. The constant-time hash comparison runs on every request, cached or not. `MerchantService.delete` evicts the entry on both sides of the delete. If Redis is down, every lookup is a miss and the filter behaves exactly as it did before this existed.
+
+> **⚑ "Doesn't caching credentials weaken security?"**
+> It would if the cache made the decision. It doesn't: it stores the *hash*, and the filter still compares the presented key against it every time. The cache can save a query; it cannot make a wrong key pass. The raw key is never stored anywhere, cache included.
+
+> **⚑ "How do you know an entry isn't stale?"**
+> By listing what can change it. The hash is written once at signup. No endpoint changes a role. Deleting a merchant does, so delete evicts. A role edited by hand in psql - which is how an admin is made - applies within the TTL. That list *is* the design; if a role-change endpoint is ever added, it has to evict too.
+
+> **⚑ "Why evict twice?"**
+> A request that read the row just before the delete can write it back into the cache just after the first eviction. The second eviction, after the delete, removes that copy. With only the first, a deleted merchant's key could keep working for up to five minutes.
+
+> **⚑ "Why not cache misses too? Attackers can spray random prefixes."**
+> A cached miss would refuse a key minted a moment later until it expired. Prefix spraying is the rate limiter's job, not the cache's.
+
+> **⚑ "How did you test that the second request came from the cache?"**
+> A hit and a database read look identical from outside, so the test breaks the database copy after the first request - it overwrites the stored hash. If the second request still authenticates, Postgres was not asked.
+
+> **⚑ "What happens when Redis goes down?"**
+> Same answer as the rate limiter: fail open. A cache outage should cost latency, never availability.
+
+---
+
 # Chapter 22 — Everything at once: one request, traced
 
 `POST /api/v1/payments`, `X-API-Key: tk_49c54...`, body `{"amountPaise": 50000, "currency": "INR"}`.
@@ -1681,7 +1707,7 @@ returned an administrator. `/api/v1/merchants/**` is `hasRole("ADMIN")`, so that
 # Chapter 23 — Rapid-fire
 
 **"Tell me about your project."**
-Use this, then offer to go deeper: *"Transakt is a payment gateway I built in Java and Spring Boot. A merchant signs up, gets an API key, and calls one endpoint to create a payment. Behind it, the payment goes to a simulated bank, the result is written to a double-entry ledger in PostgreSQL in the same transaction, and a settlement event goes out through a transactional outbox to Kafka, which drives a webhook back to the merchant. Two authentication doors — API keys for machines, JWTs for humans — idempotency so a retry can't charge twice, per-merchant rate limiting, versioned migrations, 70 tests, CI on every push, and it's deployed and running on Render."*
+Use this, then offer to go deeper: *"Transakt is a payment gateway I built in Java and Spring Boot. A merchant signs up, gets an API key, and calls one endpoint to create a payment. Behind it, the payment goes to a simulated bank, the result is written to a double-entry ledger in PostgreSQL in the same transaction, and a settlement event goes out through a transactional outbox to Kafka, which drives a webhook back to the merchant. Two authentication doors — API keys for machines, JWTs for humans — idempotency so a retry can't charge twice, per-merchant rate limiting, a Redis cache for API key lookups, versioned migrations, 79 tests, CI on every push, and it's deployed and running on Render."*
 
 **"What's the hardest bug you fixed?"**
 The three-day deployment outage. Six lines of debug scaffolding in a `CommandLineRunner`, which runs *after* the context refreshes and Tomcat binds — so everything had already succeeded and the app was dying on the victory lap. Found by reading the deploy log's `Caused by` chain bottom-up.
@@ -1788,7 +1814,7 @@ flowchart TD
   app -->|public internet - TLS required, sslmode=require| pg[(Neon - PostgreSQL 18.6 - Singapore - scales to zero)]
   app -->|private network - no TLS needed| kv[(transakt-redis - Valkey 8 - Singapore)]
   gh[GitHub ARV0007/transakt - branch main] -->|Auto-Deploy on push| build[Render build - multi-stage Dockerfile]
-  gh -->|push or pull request| ci[GitHub Actions - seventy tests against service containers]
+  gh -->|push or pull request| ci[GitHub Actions - seventy-nine tests against service containers]
   build --> app
   flyway[Flyway V1-V9 - runs at container startup, before Hibernate validates] -.-> pg
   note[Kafka is NOT deployed - it runs only in docker-compose locally] -.-> app
@@ -1898,6 +1924,7 @@ Which day built what, and where in this document it is explained.
 | 23 | 7 Sep | Listener disarmed in tests; misplaced `bank:` block; Neon | 20 |
 | 24 | 8 Sep | `eventId`, `RetentionSweeper` + V9, `PATCH /merchants/me` | 21 |
 | 25 | 11 Sep | SSRF guard; `GET /merchants/me`; signup escalation fixed; `Retry-After`; the last entity-bound body; per-IP login limiting | 21.5–21.9 |
+| 26 | 31 Oct | API key lookups cached in Redis, evicted on delete, failing open | 21.10 |
 
 **Day 24's commits:** `d744f60` (docs corrected), `831f0e8` (event id), `da42bfd` (retention), `0c7207a` (PATCH endpoint).
 
@@ -2115,6 +2142,7 @@ Ordered by how much they would matter in production.
 | 15 | **`WORKLOG.md` has four duplicated entries and no Day 15** | A documentation pass |
 | 16 | **No test sends undocumented fields** — the Day 25 escalation survived sixty tests because every one sent only documented fields | A test that posts unexpected keys on purpose |
 | 17 | **`MerchantService.delete` used to return a boolean** — now 204/404; `POST /api/v1/merchants` still returns 200, not 201 with a `Location` header | Two lines, but the status change touches eleven test files |
+| 18 | **A role changed by hand in psql applies within the API key cache TTL** (5 min), not instantly | Evict on role change once an endpoint for it exists; until then, keep the TTL short |
 
 > **⚑ "That's a long list. Doesn't it make the project look unfinished?"**
 > The opposite, and this is worth internalising. Everyone's project has this list; most candidates have not written it down and cannot answer "what's wrong with it". Being able to name 17 specific gaps, rank them, and say what the fix is demonstrates that you understand the system rather than that you assembled it. The one that impresses is **#1**, because finding a genuine SSRF vector in your own code and scoping it correctly is not a tutorial exercise.
@@ -2143,10 +2171,10 @@ When any of these change, they change in several places at once. Grep for the ol
 
 | Number | Currently |
 |---|---|
-| Tests | 70 (53 integration, 17 unit) |
+| Tests | 79 (57 integration, 22 unit) |
 | Migrations | V1–V9 |
-| Architecture version | v1.9 |
-| Days | 25 |
+| Architecture version | v1.10 |
+| Days | 26 |
 | Endpoints | 10 |
 | Known limitations | 18 |
 
@@ -2159,6 +2187,7 @@ When any of these change, they change in several places at once. Grep for the ol
 | 1.2 | 25 | Day 25 added as sections 21.5–21.7: the SSRF guard, the signup privilege escalation, `GET /me` and `Retry-After`. New failure 30.8, new rapid-fire answer |
 | 1.3 | 25 | Section 21.8 — the last entity-bound request body, and the rule it completes. `DELETE` fixed to 204/404 |
 | 1.4 | 25 | Section 21.9 — per-IP login limiting, and why `X-Forwarded-For` is the wrong header. Counts to 70 |
+| 1.5 | 26 | Section 21.10 — caching the API key lookup. New config key, new limitation, counts to 79 |
 
 ---
 
