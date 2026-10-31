@@ -1837,3 +1837,39 @@ is the shape a cache is for.
 - *Redis is not rolled back.* `@Transactional` undoes Postgres only, so the cache test
   flushes Redis before each test - the same lesson as Day 11.
 
+## Day 27 — a browser demo, and what CORS does and doesn't protect (1 Nov 2026)
+
+**Built**
+- `CorsConfig` — one `CorsConfigurationSource` bean. Allowed origins come from
+  `cors.allowed-origins` (`CORS_ALLOWED_ORIGINS`, default `https://arv0007.github.io`).
+  Methods GET, POST, PATCH; headers Content-Type, Authorization, X-API-Key,
+  Idempotency-Key; `Retry-After` exposed so a page can read how long a 429 says to wait.
+- `SecurityConfig` turns it on with `.cors(Customizer.withDefaults())`.
+- `CorsIntegrationTest`, 5 tests: the portfolio's preflight is allowed, another site's is
+  refused with 403, a simple GET gets the header, an allowed origin with no key is still
+  refused, and preflights don't use up login attempts.
+- 79 → 84 tests (62 integration, 22 unit).
+
+**Why**
+
+The portfolio has a page that signs up a throwaway merchant and makes a payment against
+the live API, so a visitor can try Transakt without a terminal. A browser won't let a
+page on `arv0007.github.io` read a response from `transakt.onrender.com` unless the API
+names that origin.
+
+**Concepts**
+- *Same-origin policy.* A page may only read responses from its own scheme + host + port
+  unless the other server opts in with `Access-Control-Allow-Origin`.
+- *Preflight.* A request with a custom header (X-API-Key) or JSON body is first asked
+  about with an `OPTIONS` request. Only if the answer names the origin, method and
+  headers does the browser send the real one.
+- *CORS is not security for the API.* It protects visitors' browsers, not the server.
+  curl ignores it entirely. Authentication is still the API key or JWT.
+- *Why allowing an origin is safe here.* Credentials are headers the page has to hold,
+  never cookies the browser attaches by itself, so an allowed site can't act as someone
+  who hasn't handed it a key. That's also why `allowCredentials` stays false.
+- *Exact origins, never `*`.* The list is the one site that needs it.
+- *Filter order matters.* Spring Security's CORS filter runs before the API key filter
+  and the login limiter, so a preflight is answered before either sees it. Otherwise
+  every browser login would count twice against the five-a-minute limit.
+
