@@ -2518,3 +2518,19 @@ Redis down is a miss, not an error - the filter goes to Postgres as it did befor
 measure the saving: `./mvnw test -Dtest=ApiKeyLookupBenchmark`, which prints p50/p95 for
 the lookup alone and for a whole request, cache cold versus warm.
 
+## CORS for the browser demo
+
+**The rule to remember: CORS protects the visitor's browser, not the API.** A browser
+refuses to let a page read a response from another origin unless that server says the
+page's origin is allowed. curl, Postman and other servers never ask.
+
+| Request from | Without CORS config | With `cors.allowed-origins=https://arv0007.github.io` |
+|---|---|---|
+| curl / a server | works | works (unchanged) |
+| A page on arv0007.github.io | blocked by the browser | allowed - still needs a key |
+| A page on any other site | blocked by the browser | blocked by the browser (preflight 403) |
+
+A request carrying `X-API-Key` makes the browser send a **preflight** `OPTIONS` first.
+Spring Security's CORS filter answers it before `ApiKeyFilter` or `RateLimitFilter` run,
+so preflights never count as login attempts (`CorsIntegrationTest` pins that).
+

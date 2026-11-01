@@ -3,7 +3,7 @@
 **A from-scratch walkthrough. Every step, why it was taken, and what you'd be asked about it.**
 
 Repo: github.com/ARV0007/transakt · Live: https://transakt.onrender.com
-Covers Days 1–26 · architecture v1.10 · 79 tests · Flyway V1–V9
+Covers Days 1–27 · architecture v1.11 · 84 tests · Flyway V1–V9
 
 ---
 
@@ -173,7 +173,7 @@ DELETE FROM idempotency_keys WHERE created_at < '2026-09-07';
 **Maven** is the build tool. `pom.xml` lists your dependencies; Maven downloads them, compiles your code, runs your tests, and packages everything into one **JAR** file — a zip containing your compiled classes plus every library, plus an embedded Tomcat web server. `java -jar app.jar` and the server is running. There is no separate server to install.
 
 ```bash
-./mvnw test        # compile + run all 79 tests
+./mvnw test        # compile + run all 84 tests
 ./mvnw package     # build the JAR
 ```
 
@@ -1665,6 +1665,37 @@ returned an administrator. `/api/v1/merchants/**` is `hasRole("ADMIN")`, so that
 
 ---
 
+## 21.11 Letting one website call the API: CORS
+
+**Restaurant version.** CORS is not the ID-card reader at the staff entrance. It's a note
+the restaurant pins on the door for *delivery apps*: "orders placed through arv0007.github.io
+are fine." The delivery app (the browser) reads the note and refuses to pass orders from
+any other app. Someone who walks up to the counter in person (curl) never reads the note,
+and still has to show an ID card (the API key).
+
+**The situation.** The portfolio has a page where a visitor clicks through signing up,
+making a payment and repeating it with the same Idempotency-Key. That page lives on
+`arv0007.github.io`; the API lives on `transakt.onrender.com`. Different origins, so the
+browser blocks the page from reading the API's answers until the API says otherwise.
+
+**What we did.** `CorsConfig` defines exactly which origins may do this (just the
+portfolio, from `CORS_ALLOWED_ORIGINS`), which methods and which headers. `SecurityConfig`
+switches it on with `.cors(Customizer.withDefaults())`.
+
+> **⚑ "Doesn't allowing another site weaken security?"**
+> No. CORS protects the visitor's browser, not the server. Anyone can already call the API with curl; the API key or JWT is what stops them doing anything as someone else. Because those credentials are headers the page must hold itself, never cookies the browser attaches automatically, an allowed site can't borrow a visitor's identity.
+
+> **⚑ "Why not `*`?"**
+> Allowing every origin would work too, for the same reason, but there is one site that needs it. Listing exactly that one keeps the config honest about who uses it.
+
+> **⚑ "What's a preflight, and why did it matter for the rate limiter?"**
+> Before a request with a custom header like `X-API-Key`, the browser sends `OPTIONS` to ask permission. Spring Security's CORS filter answers it before our filters run. If the login limiter saw preflights, every browser login would count twice against five a minute.
+
+> **⚑ "How do you test CORS without a browser?"**
+> Send what the browser would: an `OPTIONS` with `Origin` and `Access-Control-Request-*` headers, then check the `Access-Control-Allow-*` headers that come back. A request from another origin gets a 403 at the preflight.
+
+---
+
 # Chapter 22 — Everything at once: one request, traced
 
 `POST /api/v1/payments`, `X-API-Key: tk_49c54...`, body `{"amountPaise": 50000, "currency": "INR"}`.
@@ -1707,7 +1738,7 @@ returned an administrator. `/api/v1/merchants/**` is `hasRole("ADMIN")`, so that
 # Chapter 23 — Rapid-fire
 
 **"Tell me about your project."**
-Use this, then offer to go deeper: *"Transakt is a payment gateway I built in Java and Spring Boot. A merchant signs up, gets an API key, and calls one endpoint to create a payment. Behind it, the payment goes to a simulated bank, the result is written to a double-entry ledger in PostgreSQL in the same transaction, and a settlement event goes out through a transactional outbox to Kafka, which drives a webhook back to the merchant. Two authentication doors — API keys for machines, JWTs for humans — idempotency so a retry can't charge twice, per-merchant rate limiting, a Redis cache for API key lookups, versioned migrations, 79 tests, CI on every push, and it's deployed and running on Render."*
+Use this, then offer to go deeper: *"Transakt is a payment gateway I built in Java and Spring Boot. A merchant signs up, gets an API key, and calls one endpoint to create a payment. Behind it, the payment goes to a simulated bank, the result is written to a double-entry ledger in PostgreSQL in the same transaction, and a settlement event goes out through a transactional outbox to Kafka, which drives a webhook back to the merchant. Two authentication doors — API keys for machines, JWTs for humans — idempotency so a retry can't charge twice, per-merchant rate limiting, a Redis cache for API key lookups, versioned migrations, 84 tests, CI on every push, and it's deployed and running on Render, with a browser demo on my portfolio."*
 
 **"What's the hardest bug you fixed?"**
 The three-day deployment outage. Six lines of debug scaffolding in a `CommandLineRunner`, which runs *after* the context refreshes and Tomcat binds — so everything had already succeeded and the app was dying on the victory lap. Found by reading the deploy log's `Caused by` chain bottom-up.
@@ -1814,7 +1845,7 @@ flowchart TD
   app -->|public internet - TLS required, sslmode=require| pg[(Neon - PostgreSQL 18.6 - Singapore - scales to zero)]
   app -->|private network - no TLS needed| kv[(transakt-redis - Valkey 8 - Singapore)]
   gh[GitHub ARV0007/transakt - branch main] -->|Auto-Deploy on push| build[Render build - multi-stage Dockerfile]
-  gh -->|push or pull request| ci[GitHub Actions - seventy-nine tests against service containers]
+  gh -->|push or pull request| ci[GitHub Actions - eighty-four tests against service containers]
   build --> app
   flyway[Flyway V1-V9 - runs at container startup, before Hibernate validates] -.-> pg
   note[Kafka is NOT deployed - it runs only in docker-compose locally] -.-> app
@@ -1925,6 +1956,7 @@ Which day built what, and where in this document it is explained.
 | 24 | 8 Sep | `eventId`, `RetentionSweeper` + V9, `PATCH /merchants/me` | 21 |
 | 25 | 11 Sep | SSRF guard; `GET /merchants/me`; signup escalation fixed; `Retry-After`; the last entity-bound body; per-IP login limiting | 21.5–21.9 |
 | 26 | 31 Oct | API key lookups cached in Redis, evicted on delete, failing open | 21.10 |
+| 27 | 1 Nov | CORS for one origin, so the portfolio's browser demo can call the live API | 21.11 |
 
 **Day 24's commits:** `d744f60` (docs corrected), `831f0e8` (event id), `da42bfd` (retention), `0c7207a` (PATCH endpoint).
 
@@ -2171,10 +2203,10 @@ When any of these change, they change in several places at once. Grep for the ol
 
 | Number | Currently |
 |---|---|
-| Tests | 79 (57 integration, 22 unit) |
+| Tests | 84 (62 integration, 22 unit) |
 | Migrations | V1–V9 |
-| Architecture version | v1.10 |
-| Days | 26 |
+| Architecture version | v1.11 |
+| Days | 27 |
 | Endpoints | 10 |
 | Known limitations | 18 |
 
@@ -2188,6 +2220,7 @@ When any of these change, they change in several places at once. Grep for the ol
 | 1.3 | 25 | Section 21.8 — the last entity-bound request body, and the rule it completes. `DELETE` fixed to 204/404 |
 | 1.4 | 25 | Section 21.9 — per-IP login limiting, and why `X-Forwarded-For` is the wrong header. Counts to 70 |
 | 1.5 | 26 | Section 21.10 — caching the API key lookup. New config key, new limitation, counts to 79 |
+| 1.6 | 27 | Section 21.11 — CORS for the portfolio demo. New config key, counts to 84 |
 
 ---
 

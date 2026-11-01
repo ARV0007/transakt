@@ -33,7 +33,8 @@ curl -s https://transakt.onrender.com/api/v1/health
 | **Transactional outbox** | The `payment.settled` event row commits with the payment. Either both exist or neither does, so an event cannot be lost. |
 | **Kafka + webhooks** | A publisher sweeps unpublished events to Kafka; a consumer delivers them to the merchant with retries and a dead-letter topic. |
 | **API key cache** | The merchant behind an API key is cached in Redis by the key's prefix, so a repeat request skips the database lookup. The constant-time hash check still runs every time; deleting a merchant evicts its entry; Redis down means a database lookup, never a failed request. |
-| **79 tests** | 57 integration tests through the full filter chain against a real database, plus 22 unit tests where the behaviour needs a dependency to fail on demand. |
+| **Browser demo (CORS)** | Exactly one other site may call the API from a browser: the live demo on the portfolio, https://arv0007.github.io/demos/transakt/. Set by `CORS_ALLOWED_ORIGINS`. curl and servers are unaffected - CORS is a browser rule, not authentication. |
+| **84 tests** | 62 integration tests through the full filter chain against a real database, plus 22 unit tests where the behaviour needs a dependency to fail on demand. |
 
 ---
 
@@ -159,7 +160,7 @@ database at startup, so there is no setup SQL to run and nothing to configure.
 ./mvnw test
 ```
 
-Seventy-nine tests, well under a minute. Needs Postgres and Redis reachable on localhost —
+Eighty-four tests, well under a minute. Needs Postgres and Redis reachable on localhost —
 `docker compose up` provides both. The Kafka listener is disabled in the test profile, so no
 broker is required.
 
