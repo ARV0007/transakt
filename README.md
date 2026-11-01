@@ -5,7 +5,18 @@ API instead of integrating with banks directly. The bank is simulated — no rea
 
 [![CI](https://github.com/ARV0007/transakt/actions/workflows/ci.yml/badge.svg)](https://github.com/ARV0007/transakt/actions/workflows/ci.yml)
 
-**Live:** https://transakt.onrender.com · **API:** `/api/v1`
+## See it working
+
+**[Try it in your browser →](https://arv0007.github.io/transakt/)** Six steps against the live API, no
+terminal needed: wake the server, sign up, take a payment, send it again with the same
+`Idempotency-Key` (the same payment comes back), read the two ledger entries, and try a forged key.
+
+![The browser demo clicking through all six steps against the live API](https://arv0007.github.io/assets/demo/transakt-demo.gif)
+
+<sub>Recorded by a GitHub Actions workflow that opens the demo page and clicks every button against
+the live API ([how](https://github.com/ARV0007/arv0007.github.io/blob/main/.github/workflows/record-demos.yml)).</sub>
+
+**Live API:** https://transakt.onrender.com · **Base path:** `/api/v1` · **Fraud layer:** [Transakt Sentinel](https://github.com/ARV0007/transakt-sentinel) ([replay](https://arv0007.github.io/sentinel/))
 
 > Running on a free tier that sleeps after 15 minutes idle. The first request can take up to two
 > minutes to wake the instance. Every request after that is immediate.
